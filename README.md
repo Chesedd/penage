@@ -1,6 +1,6 @@
 # penage
 
-`penage` is an agent-style runtime for authorized web security labs and CTF-style targets.
+`penage` is an agent-style runtime for authorized web security and CTF-style targets.
 It combines an LLM planner, deterministic specialists, a policy layer, HTTP/sandbox tool backends,
 validation, tracing, and execution summaries in a single episode loop.
 
