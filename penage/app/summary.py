@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from penage.app.config import RuntimeConfig
+from penage.core.state import State
+
+
+def build_episode_summary(cfg: RuntimeConfig, trace_path: Path, st: State, *, base_url: str) -> dict:
+    return {
+        "experiment": {
+            "tag": cfg.experiment_tag or None,
+            "trace_path": str(trace_path),
+            "base_url": base_url,
+            "ollama_model": cfg.ollama_model,
+            "ollama_url": cfg.ollama_url,
+            "mode": cfg.mode.value,
+            "allow_static": bool(cfg.allow_static),
+            "enable_specialists": bool(cfg.enable_specialists),
+            "policy": "on" if cfg.policy_enabled else "off",
+            "actions_per_step": int(cfg.actions_per_step),
+            "max_steps": int(cfg.max_steps),
+            "max_http_requests": int(cfg.max_http_requests),
+            "max_total_text_len": int(cfg.max_total_text_len),
+            "sandbox_backend": cfg.sandbox_backend,
+            "docker_image": cfg.docker_image,
+            "docker_network": cfg.docker_network,
+        },
+        "result": {
+            "notes": list(st.notes),
+            "final_step": int(st.facts.get("orch_step") or 0),
+            "known_paths_count": len(st.known_paths),
+            "forms_by_url_count": len(st.forms_by_url),
+            "best_http_url": st.best_http_url,
+            "best_http_score": st.best_http_score,
+            "best_http_ids": list(st.best_http_ids[:30]),
+            "last_action_family": st.last_action_family,
+            "same_action_family_streak": st.same_action_family_streak,
+            "policy_source_counts": dict(sorted(st.policy_source_counts.items())),
+            "http_status_counts": dict(sorted(st.http_status_counts.items(), key=lambda kv: int(kv[0]))),
+            "novel_http_responses": st.novel_http_responses,
+            "useful_http_responses": st.useful_http_responses,
+            "failure_http_responses": st.failure_http_responses,
+            "form_pages_seen": st.form_pages_seen,
+            "research_negatives_count": len(st.research_negatives),
+            "research_negative_families_count": len(st.research_negative_families),
+            "recent_failures_count": len(st.recent_failures),
+            "last_macro_name": st.facts.get("last_macro_name"),
+            "macro_session_established": bool(st.facts.get("macro_session_established")),
+            "recent_http_memory_count": len(st.recent_http_memory),
+            "no_new_paths_streak": st.no_new_paths_streak,
+            "auth_confusion_runs": int(st.facts.get("auth_confusion_runs") or 0),
+            "auth_confusion_last_step": int(st.facts.get("auth_confusion_last_step") or 0),
+            "validation_evidence_count": int(st.validation_evidence_count),
+            "validation_validated_count": int(st.validation_validated_count),
+            "usage": {
+                "llm_calls": st.llm_calls,
+                "tool_calls_total": st.tool_calls_total,
+                "tool_calls_http": st.tool_calls_http,
+                "tool_calls_sandbox": st.tool_calls_sandbox,
+                "tool_elapsed_ms_total": st.tool_elapsed_ms_total,
+                "http_requests_used": st.http_requests_used,
+                "total_text_len_seen": st.total_text_len_seen,
+            },
+        },
+        "previews": {
+            "research_hypotheses": list(st.research_hypotheses[:8]),
+            "research_fuzz_paths": list(st.research_fuzz_paths[:20]),
+            "research_negatives": list(st.research_negatives[-20:]),
+            "recent_failures": list(st.recent_failures[-st.recent_failures_limit:]),
+            "recent_http_memory": list(st.recent_http_memory[-st.recent_http_memory_limit:]),
+            "specialist_candidates_preview": list((st.facts.get("specialist_candidates_preview") or [])[:12]),
+            "research_candidates_preview": list((st.facts.get("research_candidates_preview") or [])[:12]),
+            "auth_confusion_last_stats": dict(st.facts.get("auth_confusion_last_stats") or {}),
+            "auth_confusion_last_hits_preview": list((st.facts.get("auth_confusion_last_hits_preview") or [])[:10]),
+            "validation_results_preview": list(st.validation_results[-min(len(st.validation_results), 6):]),
+            "macro_followup_hits_preview": list((st.facts.get("macro_followup_hits_preview") or [])[:8]),
+            "macro_family_hits_preview": list((st.facts.get("macro_family_hits_preview") or [])[:8]),
+        },
+    }
