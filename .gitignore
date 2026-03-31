@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+runs/
+*.jsonl
+*.summary.json
+*.trace.jsonl
+
+# Local scratch / exported dumps
+_flat_sources/
+repo_starter_pack/
+*.tmp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/

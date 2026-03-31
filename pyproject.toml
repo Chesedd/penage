@@ -1,9 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "penage"
 version = "0.1.0"
-requires-python = ">=3.11"
+description = "Agent-style runtime for authorized web security labs and CTF targets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "N.Chuev" }
+]
+dependencies = [
+  "httpx>=0.27,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["penage*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
-pythonpath = ["."]
+python_files = ["test_*.py"]
