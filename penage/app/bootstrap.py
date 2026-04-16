@@ -6,7 +6,7 @@ from penage.app.config import RuntimeConfig
 from penage.app.runtime_factory import build_runtime_components
 from penage.core.orchestrator import Orchestrator
 from penage.core.tracer import JsonlTracer
-from penage.llm.ollama import OllamaClient
+from penage.llm.base import LLMClient
 from penage.tools.runner import ToolRunner
 
 
@@ -14,7 +14,7 @@ from penage.tools.runner import ToolRunner
 class BootstrapBundle:
     base_url: str
     tools: ToolRunner
-    llm: OllamaClient
+    llm: LLMClient
     orchestrator: Orchestrator
 
 

@@ -24,8 +24,23 @@ def build_user_prompt(base_url: str) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="penage-run-one")
     p.add_argument("--base-url", required=True, help="Target base URL, e.g. http://localhost:8080")
-    p.add_argument("--ollama-model", required=True, help="Ollama model name, e.g. llama3.1")
+
+    p.add_argument(
+        "--llm-provider",
+        choices=["ollama", "anthropic", "openai"],
+        default="ollama",
+        help="LLM backend to use",
+    )
+    p.add_argument(
+        "--llm-model",
+        default="",
+        help="Model name (overrides --ollama-model when provider=ollama; required for anthropic/openai)",
+    )
+
+    # Backward-compat flags for Ollama
+    p.add_argument("--ollama-model", default="", help="Ollama model name, e.g. llama3.1 (backward-compat)")
     p.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
+
     p.add_argument("--allowed-host", action="append", default=[], help="Additional allowed host for HTTP tool (repeatable)")
 
     p.add_argument("--max-steps", type=int, default=30)
