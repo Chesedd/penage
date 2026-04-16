@@ -40,6 +40,11 @@ class RuntimeConfig:
     experiment_tag: str
     allowed_hosts: tuple[str, ...]
 
+    # Early-stop thresholds
+    early_stop_tool_calls: int = 40
+    early_stop_cost_usd: float = 0.30
+    early_stop_seconds: float = 300.0
+
 
 def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
     summary_path = Path(args.summary_json) if getattr(args, "summary_json", "") else None
@@ -73,6 +78,9 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         sandbox_backend=str(args.sandbox_backend),
         docker_image=str(args.docker_image),
         docker_network=str(args.docker_network),
+        early_stop_tool_calls=int(getattr(args, "early_stop_tool_calls", 40) or 40),
+        early_stop_cost_usd=float(getattr(args, "early_stop_cost", 0.30) or 0.30),
+        early_stop_seconds=float(getattr(args, "early_stop_seconds", 300.0) or 300.0),
         experiment_tag=str(getattr(args, "experiment_tag", "") or ""),
         allowed_hosts=tuple(str(x) for x in getattr(args, "allowed_host", []) or []),
     )

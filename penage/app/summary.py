@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from penage.app.config import RuntimeConfig
 from penage.core.state import State
+from penage.core.usage import UsageTracker
 
 
-def build_episode_summary(cfg: RuntimeConfig, trace_path: Path, st: State, *, base_url: str) -> dict:
-    return {
+def build_episode_summary(
+    cfg: RuntimeConfig,
+    trace_path: Path,
+    st: State,
+    *,
+    base_url: str,
+    tracker: Optional[UsageTracker] = None,
+) -> dict:
+    summary: dict = {
         "experiment": {
             "tag": cfg.experiment_tag or None,
             "trace_path": str(trace_path),
@@ -80,3 +89,8 @@ def build_episode_summary(cfg: RuntimeConfig, trace_path: Path, st: State, *, ba
             "macro_family_hits_preview": list(st.macro.family_hits_preview[:8]),
         },
     }
+
+    if tracker is not None:
+        summary["resource_stats"] = tracker.to_dict()
+
+    return summary

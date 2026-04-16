@@ -10,6 +10,7 @@ from penage.app.summary import build_episode_summary
 from penage.core.guard import RunMode
 from penage.core.state import State
 from penage.core.tracer import JsonlTracer
+from penage.core.usage import EarlyStopThresholds
 
 
 def build_user_prompt(base_url: str) -> str:
@@ -61,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--docker-image", default="python:3.12-slim")
     p.add_argument("--docker-network", default="none", choices=["none", "bridge", "host"])
 
+    p.add_argument("--early-stop-tool-calls", type=int, default=40, help="Stop episode after this many tool calls")
+    p.add_argument("--early-stop-cost", type=float, default=0.30, help="Stop episode after this USD API cost")
+    p.add_argument("--early-stop-seconds", type=float, default=300.0, help="Stop episode after this many wall-clock seconds")
+
     p.add_argument("--experiment-tag", default="", help="Optional experiment tag for A/B runs")
 
     return p.parse_args()
@@ -74,16 +79,23 @@ async def main_async() -> int:
     bundle = build_runtime(cfg, tracer)
 
     try:
-        st = await bundle.orchestrator.run_episode(
+        thresholds = EarlyStopThresholds(
+            max_tool_calls=cfg.early_stop_tool_calls,
+            max_cost_usd=cfg.early_stop_cost_usd,
+            max_wall_clock_s=cfg.early_stop_seconds,
+        )
+
+        st, tracker = await bundle.orchestrator.run_episode(
             user_prompt=build_user_prompt(bundle.base_url),
             state=State(base_url=bundle.base_url),
             max_steps=cfg.max_steps,
             actions_per_step=cfg.actions_per_step,
             max_http_requests=cfg.max_http_requests,
             max_total_text_len=cfg.max_total_text_len,
+            early_stop=thresholds,
         )
 
-        summary = build_episode_summary(cfg, cfg.trace_path, st, base_url=bundle.base_url)
+        summary = build_episode_summary(cfg, cfg.trace_path, st, base_url=bundle.base_url, tracker=tracker)
         tracer.record_summary(summary, step=st.orch_step)
 
         summary_path = cfg.summary_path or cfg.trace_path.with_suffix(".summary.json")
