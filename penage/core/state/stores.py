@@ -62,3 +62,25 @@ class SpecialistTracking:
     candidates_preview: list[dict[str, object]] = field(default_factory=list)
     errors_preview: list[dict[str, object]] = field(default_factory=list)
     source_counts_preview: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FilterModel:
+    """Inferred input-filter behaviour for a single parameter/channel.
+
+    Populated by :class:`penage.specialists.shared.filter_inferrer.FilterInferrer`.
+    Each probe falls into exactly one of three buckets:
+
+    - ``allowed_tags`` / ``allowed_events`` — echoed verbatim.
+    - ``blocked_tags`` / ``blocked_events`` — removed from the response.
+    - ``transformed_chars`` — character-level rewrites (``{char: transform}``).
+      Example: ``{'<': '&lt;'}`` means ``<`` was HTML-entity encoded.
+    """
+
+    parameter: str = ""
+    channel: str = ""
+    allowed_tags: list[str] = field(default_factory=list)
+    blocked_tags: list[str] = field(default_factory=list)
+    allowed_events: list[str] = field(default_factory=list)
+    blocked_events: list[str] = field(default_factory=list)
+    transformed_chars: dict[str, str] = field(default_factory=dict)
