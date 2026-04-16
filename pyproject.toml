@@ -13,6 +13,7 @@ authors = [
   { name = "N.Chuev" }
 ]
 dependencies = [
+  "aiohttp>=3.9,<4.0",
   "httpx>=0.27,<1.0",
   "pyyaml>=6.0,<7.0",
 ]
