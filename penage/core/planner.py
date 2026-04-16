@@ -167,7 +167,7 @@ class Planner:
         t = str(a.get("type") or "").lower()
         try:
             at = ActionType(t)
-        except Exception:
+        except ValueError:
             at = ActionType.NOTE
 
         params = a.get("params") or {}

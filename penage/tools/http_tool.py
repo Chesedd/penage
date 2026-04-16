@@ -74,6 +74,6 @@ class HttpTool:
         except httpx.TimeoutException:
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             return Observation(ok=False, elapsed_ms=elapsed_ms, error=f"HTTP timeout after {timeout_s}s")
-        except Exception as e:
+        except Exception as e:  # LEGACY: catch-all at HTTP boundary
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             return Observation(ok=False, elapsed_ms=elapsed_ms, error=f"HTTP request failed: {e}")
