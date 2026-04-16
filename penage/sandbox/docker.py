@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from penage.core.errors import SandboxError
 from penage.sandbox.base import SandboxResult
 
 
@@ -52,8 +53,7 @@ class DockerSandbox:
                 stderr=asyncio.subprocess.PIPE,
             )
             await proc.communicate()
-        except Exception:
-            # best-effort cleanup
+        except Exception:  # LEGACY: best-effort cleanup
             pass
 
     async def run_shell(
@@ -138,8 +138,8 @@ class DockerSandbox:
             stdout_b, stderr_b = await proc.communicate()
         except FileNotFoundError:
             return None
-        except Exception:
-            return None
+        except OSError as e:
+            raise SandboxError("failed to start docker daemon container", cause=e) from e
 
         if int(proc.returncode or 0) != 0:
             _ = stderr_b
@@ -201,7 +201,7 @@ class DockerSandbox:
                     elapsed_ms=int((time.perf_counter() - t0) * 1000),
                     error="docker not found",
                 )
-            except Exception as e:
+            except OSError as e:
                 return SandboxResult(
                     ok=False,
                     exit_code=1,
@@ -212,43 +212,40 @@ class DockerSandbox:
                 )
 
             try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                proc.kill()
                 try:
-                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    try:
-                        await proc.communicate()
-                    except Exception:
-                        pass
-                    return SandboxResult(
-                        ok=False,
-                        exit_code=124,
-                        stdout="",
-                        stderr=f"timeout after {timeout_s}s",
-                        elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                        error="timeout",
-                    )
-
-                stdout = (stdout_b or b"").decode(errors="replace")
-                stderr = (stderr_b or b"").decode(errors="replace")
-
-                if len(stdout) > self.max_output_chars:
-                    stdout = stdout[: self.max_output_chars] + "\n<...truncated...>\n"
-                if len(stderr) > self.max_output_chars:
-                    stderr = stderr[: self.max_output_chars] + "\n<...truncated...>\n"
-
-                exit_code = int(proc.returncode or 0)
-                ok = exit_code == 0
+                    await proc.communicate()
+                except Exception:  # LEGACY: best-effort after kill
+                    pass
                 return SandboxResult(
-                    ok=ok,
-                    exit_code=exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
+                    ok=False,
+                    exit_code=124,
+                    stdout="",
+                    stderr=f"timeout after {timeout_s}s",
                     elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                    error=None if ok else "nonzero exit",
+                    error="timeout",
                 )
-            finally:
-                pass
+
+            stdout = (stdout_b or b"").decode(errors="replace")
+            stderr = (stderr_b or b"").decode(errors="replace")
+
+            if len(stdout) > self.max_output_chars:
+                stdout = stdout[: self.max_output_chars] + "\n<...truncated...>\n"
+            if len(stderr) > self.max_output_chars:
+                stderr = stderr[: self.max_output_chars] + "\n<...truncated...>\n"
+
+            exit_code = int(proc.returncode or 0)
+            ok = exit_code == 0
+            return SandboxResult(
+                ok=ok,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                error=None if ok else "nonzero exit",
+            )
 
     async def _run_in_container(
         self,
@@ -279,7 +276,7 @@ class DockerSandbox:
                 elapsed_ms=int((time.perf_counter() - t0) * 1000),
                 error="docker not found",
             )
-        except Exception as e:
+        except OSError as e:
             return SandboxResult(
                 ok=False,
                 exit_code=1,
@@ -290,40 +287,37 @@ class DockerSandbox:
             )
 
         try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.communicate()
-                except Exception:
-                    pass
-                return SandboxResult(
-                    ok=False,
-                    exit_code=124,
-                    stdout="",
-                    stderr=f"timeout after {timeout_s}s",
-                    elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                    error="timeout",
-                )
-
-            stdout = (stdout_b or b"").decode(errors="replace")
-            stderr = (stderr_b or b"").decode(errors="replace")
-
-            if len(stdout) > self.max_output_chars:
-                stdout = stdout[: self.max_output_chars] + "\n<...truncated...>\n"
-            if len(stderr) > self.max_output_chars:
-                stderr = stderr[: self.max_output_chars] + "\n<...truncated...>\n"
-
-            exit_code = int(proc.returncode or 0)
-            ok = exit_code == 0
+                await proc.communicate()
+            except Exception:  # LEGACY: best-effort after kill
+                pass
             return SandboxResult(
-                ok=ok,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
+                ok=False,
+                exit_code=124,
+                stdout="",
+                stderr=f"timeout after {timeout_s}s",
                 elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                error=None if ok else "nonzero exit",
+                error="timeout",
             )
-        finally:
-            pass
+
+        stdout = (stdout_b or b"").decode(errors="replace")
+        stderr = (stderr_b or b"").decode(errors="replace")
+
+        if len(stdout) > self.max_output_chars:
+            stdout = stdout[: self.max_output_chars] + "\n<...truncated...>\n"
+        if len(stderr) > self.max_output_chars:
+            stderr = stderr[: self.max_output_chars] + "\n<...truncated...>\n"
+
+        exit_code = int(proc.returncode or 0)
+        ok = exit_code == 0
+        return SandboxResult(
+            ok=ok,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            error=None if ok else "nonzero exit",
+        )

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from penage.core.errors import LLMResponseError
 from penage.llm.base import LLMClient, LLMMessage, LLMResponse
 
 _JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
@@ -28,7 +29,7 @@ def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
         candidate = m.group(1)
         try:
             return json.loads(candidate)
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             return None
 
     if "{" in text and "}" in text:
@@ -38,7 +39,7 @@ def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
             candidate = text[start : end + 1]
             try:
                 return json.loads(candidate)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 return None
     return None
 
@@ -182,7 +183,7 @@ class OllamaClient(LLMClient):
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
-            raise httpx.RemoteProtocolError("Ollama /api/chat returned non-object JSON")
+            raise LLMResponseError("Ollama /api/chat returned non-object JSON")
         return data
 
     def _response_text(self, data: Dict[str, Any]) -> str:
@@ -243,7 +244,7 @@ class OllamaClient(LLMClient):
                 body = ""
                 try:
                     body = (e.response.text or "")[:800] if e.response is not None else ""
-                except Exception:
+                except Exception:  # LEGACY: response body read can fail many ways
                     body = ""
 
                 if attempt >= self.max_retries:

@@ -23,12 +23,12 @@ class ToolRunner:
     async def aclose(self) -> None:
         try:
             await self.http_backend.aclose()
-        except Exception:
+        except Exception:  # LEGACY: best-effort cleanup
             pass
 
         try:
             await self.sandbox_tool.aclose()
-        except Exception:
+        except Exception:  # LEGACY: best-effort cleanup
             pass
 
     @classmethod
