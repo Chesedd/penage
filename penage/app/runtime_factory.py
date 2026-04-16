@@ -29,8 +29,9 @@ from penage.specialists.research import ResearchSpecialist
 from penage.specialists.research_llm import ResearchLLMSpecialist
 from penage.specialists.sandbox_smoke import SandboxSmokeSpecialist
 from penage.specialists.sqli import SqliSpecialist
-from penage.specialists.xss import XssSpecialist
+from penage.specialists.vulns.xss import XssSpecialist
 from penage.tools.runner import ToolRunner
+from penage.validation.browser import BrowserVerifier
 
 
 @dataclass(slots=True)
@@ -126,10 +127,23 @@ def build_macro_executor() -> MacroExecutor:
 
 
 def build_specialists(
-    cfg: RuntimeConfig, llm: LLMClient, *, memory: MemoryStore | None = None
+    cfg: RuntimeConfig,
+    llm: LLMClient,
+    *,
+    memory: MemoryStore | None = None,
+    tools: ToolRunner | None = None,
+    tracer: JsonlTracer | None = None,
 ) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
+
+    xss = XssSpecialist(
+        http_tool=tools.http_backend if tools is not None else None,
+        llm_client=llm,
+        memory=memory,
+        browser_verifier=BrowserVerifier(),
+        tracer=tracer,
+    )
 
     return SpecialistManager(
         specialists=[
@@ -140,7 +154,7 @@ def build_specialists(
             NavigatorSpecialist(),
             ResearchSpecialist(),
             ResearchLLMSpecialist(llm),
-            XssSpecialist(),
+            xss,
             SqliSpecialist(),
         ],
         llm=llm,
@@ -173,7 +187,7 @@ def build_orchestrator(
         guard=ExecutionGuard(allowed=allowed_action_types_for_mode(cfg.mode)),
         url_guard=UrlGuard(block_static_assets=(not cfg.allow_static)),
         policy=build_policy(cfg),
-        specialists=build_specialists(cfg, llm, memory=memory),
+        specialists=build_specialists(cfg, llm, memory=memory, tools=tools, tracer=tracer),
         macro_executor=build_macro_executor(),
         memory=memory,
     )
