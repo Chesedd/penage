@@ -61,7 +61,7 @@ async def main_async() -> int:
     try:
         st = await bundle.orchestrator.run_episode(
             user_prompt=build_user_prompt(bundle.base_url),
-            state=State(facts={"base_url": bundle.base_url}),
+            state=State(base_url=bundle.base_url),
             max_steps=cfg.max_steps,
             actions_per_step=cfg.actions_per_step,
             max_http_requests=cfg.max_http_requests,
@@ -69,7 +69,7 @@ async def main_async() -> int:
         )
 
         summary = build_episode_summary(cfg, cfg.trace_path, st, base_url=bundle.base_url)
-        tracer.record_summary(summary, step=int(st.facts.get("orch_step") or 0))
+        tracer.record_summary(summary, step=st.orch_step)
 
         summary_path = cfg.summary_path or cfg.trace_path.with_suffix(".summary.json")
         summary_path.parent.mkdir(parents=True, exist_ok=True)

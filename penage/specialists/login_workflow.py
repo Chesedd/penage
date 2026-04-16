@@ -37,7 +37,7 @@ class LoginWorkflowSpecialist:
             return []
 
         pw_form = _find_form_with_field(forms, "password")
-        if pw_form and not state.facts.get("login_workflow_password_tried"):
+        if pw_form:
             action_url = str(pw_form.get("action") or state.last_http_url or "")
             if action_url:
                 a = Action(
@@ -57,7 +57,7 @@ class LoginWorkflowSpecialist:
                 ]
 
         user_form = _find_form_with_field(forms, "username")
-        if user_form and not _has_field(user_form, "password") and not state.facts.get("login_workflow_username_tried"):
+        if user_form and not _has_field(user_form, "password"):
             action_url = str(user_form.get("action") or state.last_http_url or "")
             if action_url:
                 a = Action(

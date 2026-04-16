@@ -74,7 +74,7 @@ class ProbeResourceFamilyMacro:
     name: str = "probe_resource_family"
 
     async def run(self, *, args: Dict[str, Any], ctx: MacroExecutionContext) -> Observation:
-        base_url = str(args.get("base_url") or ctx.state.facts.get("base_url") or "")
+        base_url = str(args.get("base_url") or ctx.state.base_url or "")
         seed_path = str(args.get("seed_path") or "").strip()
         family_kind = str(args.get("family_kind") or "generic").strip().lower()
 

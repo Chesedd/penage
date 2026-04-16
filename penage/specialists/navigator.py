@@ -63,8 +63,7 @@ def _looks_like_asset(url: str) -> bool:
 
 
 def _pivot_active(st: State) -> bool:
-    curr_step = int(st.facts.get("orch_step") or 0)
-    return curr_step <= int(getattr(st, "promoted_pivot_active_until_step", 0) or 0)
+    return st.orch_step <= st.promoted_pivot_active_until_step
 
 
 def _pivot_targets(st: State) -> list[str]:
@@ -97,7 +96,7 @@ class NavigatorSpecialist:
     name: str = "navigator"
 
     def propose(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
-        base_url = str(state.facts.get("base_url") or "")
+        base_url = state.base_url
         if not base_url:
             return []
 

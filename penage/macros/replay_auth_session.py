@@ -37,7 +37,7 @@ class ReplayAuthSessionMacro:
             return Observation(ok=False, error="macro_missing_login_action")
 
         login_action = coerce_http_action(login_spec)
-        base_url = str(args.get("base_url") or ctx.state.facts.get("base_url") or "")
+        base_url = str(args.get("base_url") or ctx.state.base_url or "")
         followup_paths = args.get("followup_paths") or list(DEFAULT_FOLLOWUP_PATHS)
         if not isinstance(followup_paths, list):
             followup_paths = list(DEFAULT_FOLLOWUP_PATHS)

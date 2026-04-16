@@ -60,7 +60,7 @@ class ObservationStateProjector:
             self._project_auth_confusion_hits(st, auth_hits)
             stats = obj.get("stats")
             if isinstance(stats, dict):
-                st.facts["auth_confusion_last_stats"] = stats
+                st.auth.confusion_last_stats = stats
 
         before = len(st.known_paths)
 
@@ -72,13 +72,11 @@ class ObservationStateProjector:
         ids = obj.get("ids")
         if isinstance(ids, list):
             page_ids = [x for x in ids if isinstance(x, str)][:40]
-            st.facts["page_ids"] = page_ids
+            st.page_ids = page_ids
             if page_ids:
                 from penage.core.state_helpers import dedup_keep_order
 
                 st.best_http_ids = dedup_keep_order(st.best_http_ids + page_ids, limit=40)
-
-        st.facts["known_paths_count"] = len(st.known_paths)
 
         tags = list(getattr(action, "tags", None) or [])
         if "curl" in tags and "recon" in tags:
@@ -87,15 +85,15 @@ class ObservationStateProjector:
             self._project_research_fuzz(st, action=action)
 
     def _project_auth_confusion_hits(self, st: State, auth_hits: list[dict[str, object]]) -> None:
-        st.facts["auth_confusion_runs"] = int(st.facts.get("auth_confusion_runs") or 0) + 1
-        st.facts["auth_confusion_last_step"] = int(st.facts.get("orch_step") or 0)
-        st.facts["auth_confusion_last_hits_preview"] = auth_hits[:10]
+        st.auth.confusion_runs += 1
+        st.auth.confusion_last_step = st.orch_step
+        st.auth.confusion_last_hits_preview = auth_hits[:10]
 
         winning_ids = promoted_ids_from_auth_hits(auth_hits)
         winning_targets = promoted_path_candidates_from_auth_hits(auth_hits)
 
         if winning_ids:
-            st.facts["auth_confusion_winning_ids"] = winning_ids[:8]
+            st.auth.confusion_winning_ids = winning_ids[:8]
 
         if winning_ids or winning_targets:
             self.research_state.promote_confirmed_pivot(
@@ -107,7 +105,7 @@ class ObservationStateProjector:
                 ttl_steps=6,
             )
 
-        bad_form_actions = list(st.facts.get("auth_confusion_bad_form_actions") or [])
+        bad_form_actions = list(st.auth.confusion_bad_form_actions)
         bad_seen = set(str(x) for x in bad_form_actions)
 
         for hit in auth_hits:
@@ -129,11 +127,11 @@ class ObservationStateProjector:
                     bad_form_actions.append(form_action)
 
         if bad_form_actions:
-            st.facts["auth_confusion_bad_form_actions"] = bad_form_actions[:16]
+            st.auth.confusion_bad_form_actions = bad_form_actions[:16]
 
     def _project_curl_recon(self, st: State, *, action: Action, obj: dict, before: int, after: int) -> None:
-        st.facts["curl_recon_runs"] = int(st.facts.get("curl_recon_runs") or 0) + 1
-        st.facts["curl_recon_last_step"] = int(st.facts.get("orch_step") or 0)
+        st.curl_recon.runs += 1
+        st.curl_recon.last_step = st.orch_step
 
         stats = obj.get("stats") if isinstance(obj.get("stats"), dict) else {}
         asset_like = int(stats.get("asset_like") or 0) if isinstance(stats, dict) else 0
@@ -142,19 +140,19 @@ class ObservationStateProjector:
         new_paths_added = max(0, after - before)
         only_assets = paths_total > 0 and asset_like >= paths_total
         if new_paths_added <= 0 or only_assets:
-            st.facts["curl_recon_useless_streak"] = int(st.facts.get("curl_recon_useless_streak") or 0) + 1
+            st.curl_recon.useless_streak += 1
         else:
-            st.facts["curl_recon_useless_streak"] = 0
+            st.curl_recon.useless_streak = 0
 
     def _project_research_fuzz(self, st: State, *, action: Action) -> None:
-        st.facts["research_fuzz_runs"] = int(st.facts.get("research_fuzz_runs") or 0) + 1
-        st.facts["research_last_fuzz_step"] = int(st.facts.get("orch_step") or 0)
+        st.research_tracking.fuzz_runs += 1
+        st.research_tracking.last_fuzz_step = st.orch_step
         cmd = (action.params or {}).get("command")
         if isinstance(cmd, str) and cmd:
-            st.facts["research_last_fuzz_fp"] = str(hash(cmd))
+            st.research_tracking.last_fuzz_fp = str(hash(cmd))
 
     def _project_macro_result(self, st: State, obs: Observation) -> None:
-        st.facts["last_macro_result"] = obs.data
+        st.macro.last_result = obs.data
 
         paths = obs.data.get("paths") or []
         if isinstance(paths, list):
@@ -164,33 +162,33 @@ class ObservationStateProjector:
 
         macro_name = str(obs.data.get("macro_name") or "")
         if macro_name:
-            st.facts["last_macro_name"] = macro_name
+            st.macro.last_name = macro_name
 
         if macro_name == "replay_auth_session":
             if bool(obs.data.get("session_established")):
-                st.facts["macro_session_established"] = True
+                st.auth.session_established = True
 
             hits = obs.data.get("meaningful_hits") or []
             if isinstance(hits, list):
-                st.facts["macro_auth_followup_hits_preview"] = hits[:8]
+                st.macro.auth_followup_hits_preview = hits[:8]
 
         if macro_name == "follow_authenticated_branch":
             hits = obs.data.get("hits") or []
             if isinstance(hits, list):
-                st.facts["macro_followup_hits_preview"] = hits[:8]
+                st.macro.followup_hits_preview = hits[:8]
 
             rec = obs.data.get("recommended_next") or []
             if isinstance(rec, list):
-                st.facts["macro_followup_recommended_next"] = rec[:8]
+                st.macro.followup_recommended_next = rec[:8]
 
         if macro_name == "probe_resource_family":
             hits = obs.data.get("hits") or []
             if isinstance(hits, list):
-                st.facts["macro_family_hits_preview"] = hits[:8]
+                st.macro.family_hits_preview = hits[:8]
 
             rec = obs.data.get("recommended_next") or []
             if isinstance(rec, list):
-                st.facts["macro_family_recommended_next"] = rec[:8]
+                st.macro.family_recommended_next = rec[:8]
 
     def _project_http_result(self, st: State, *, action_family: str, obs: Observation) -> None:
         st.last_http_status = obs.data.get("status_code")
@@ -211,9 +209,6 @@ class ObservationStateProjector:
         )
 
         st.last_http_text_full = full_s
-        st.facts["last_http_text_full"] = full_s
-        st.facts["last_http_status"] = st.last_http_status
-        st.facts["last_http_url"] = st.last_http_url
 
         html_for_extraction = full_s or (st.last_http_excerpt or "")
         before = len(st.known_paths)
@@ -225,9 +220,8 @@ class ObservationStateProjector:
 
         after = len(st.known_paths)
         st.known_paths_count_prev = before
-        st.facts["known_paths_count"] = after
 
-        base = st.facts.get("base_url") or st.last_http_url or ""
+        base = st.base_url or st.last_http_url or ""
         forms = extract_forms(html_for_extraction)
         st.last_forms = []
 
@@ -255,9 +249,6 @@ class ObservationStateProjector:
 
         if st.last_http_url:
             st.forms_by_url[st.last_http_url] = st.last_forms
-        st.facts["forms_by_url_keys"] = sorted(list(st.forms_by_url.keys()))[:20]
-        st.facts["last_forms"] = st.last_forms
-
         st.http_requests_used += 1
         text_len = obs.data.get("text_len")
         if isinstance(text_len, int):
@@ -265,15 +256,10 @@ class ObservationStateProjector:
         elif full_s:
             st.total_text_len_seen += len(full_s)
 
-        st.facts["http_requests_used"] = st.http_requests_used
-        st.facts["total_text_len_seen"] = st.total_text_len_seen
-
         if after <= before:
             st.no_new_paths_streak += 1
         else:
             st.no_new_paths_streak = 0
-        st.facts["no_new_paths_streak"] = st.no_new_paths_streak
-
         status = int(st.last_http_status or 0)
         score = self._http_score(full_s=full_s, status=status, is_login_gate_http=is_login_gate_http, is_static_http=is_static_http)
 
@@ -286,14 +272,8 @@ class ObservationStateProjector:
             st.best_http_ids = ids_u
             st.best_http_paths = sorted(list(st.known_paths))[:200]
 
-            st.facts["best_http_score"] = st.best_http_score
-            st.facts["best_http_url"] = st.best_http_url
-            st.facts["best_http_ids"] = st.best_http_ids[:30]
-            st.facts["best_http_paths_preview"] = st.best_http_paths[:30]
-
         if (not is_static_http) and (not is_login_gate_http) and ids_u and not st.best_http_ids:
             st.best_http_ids = ids_u[:40]
-            st.facts["best_http_ids"] = st.best_http_ids[:30]
 
         self.research_state.record_recent_http_memory(
             st,

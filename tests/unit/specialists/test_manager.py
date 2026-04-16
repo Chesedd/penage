@@ -84,8 +84,8 @@ async def test_specialist_manager_records_errors_and_runs_async_specialists():
 
     assert len(out) == 1
     assert out[0].source == "asyncer"
-    assert state.facts["specialist_source_counts_preview"] == {"asyncer": 1}
-    errs = state.facts["specialist_errors_preview"]
+    assert state.specialist.source_counts_preview == {"asyncer": 1}
+    errs = state.specialist.errors_preview
     assert len(errs) == 1
     assert errs[0]["specialist"] == "broken"
     assert errs[0]["error_type"] == "RuntimeError"

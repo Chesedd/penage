@@ -4,7 +4,8 @@ from penage.core.state import State
 
 def test_planner_context_includes_active_pivot_and_constraint():
     st = State(
-        facts={"base_url": "http://localhost", "orch_step": 3},
+        base_url="http://localhost",
+        orch_step=3,
         known_paths={"/dashboard", "/orders"},
         promoted_pivot_targets=["/orders/123"],
         promoted_pivot_ids=["123"],

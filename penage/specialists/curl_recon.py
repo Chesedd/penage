@@ -21,24 +21,20 @@ class CurlReconSpecialist:
     def propose(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
         _ = config
 
-        base_url = str(state.facts.get("base_url") or "")
+        base_url = state.base_url
         if not base_url:
             return []
 
         if state.tool_calls_sandbox <= 0:
             return []
 
-        ran = int(state.facts.get("curl_recon_runs") or 0)
-        if ran >= self.max_runs:
+        if state.curl_recon.runs >= self.max_runs:
             return []
 
-        last_step = int(state.facts.get("curl_recon_last_step") or 0)
-        current_step = int(state.facts.get("orch_step") or 0)
-        if last_step and current_step and (current_step - last_step) < self.cooldown_steps:
+        if state.curl_recon.last_step and state.orch_step and (state.orch_step - state.curl_recon.last_step) < self.cooldown_steps:
             return []
 
-        useless = int(state.facts.get("curl_recon_useless_streak") or 0)
-        if useless >= 2:
+        if state.curl_recon.useless_streak >= 2:
             return []
 
         url = self._choose_target_url(state, base_url=base_url)
@@ -48,7 +44,7 @@ class CurlReconSpecialist:
         if self._looks_like_asset(url):
             return []
 
-        last_target = str(state.facts.get("curl_recon_last_target_url") or "")
+        last_target = state.curl_recon.last_target_url
         if last_target and last_target == url:
             return []
 
@@ -126,7 +122,7 @@ print(json.dumps(out, ensure_ascii=False))
             tags=["sandbox", "curl", "recon"],
         )
 
-        state.facts["curl_recon_last_target_url"] = url
+        state.curl_recon.last_target_url = url
 
         return [
             CandidateAction(

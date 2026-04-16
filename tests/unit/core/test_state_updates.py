@@ -15,7 +15,7 @@ def _updater(tmp_path):
 
 def test_state_updater_records_negative_http_result_and_recent_memory(tmp_path):
     updater = _updater(tmp_path)
-    st = State(facts={"base_url": "http://localhost", "orch_step": 1})
+    st = State(base_url="http://localhost", orch_step=1)
     action = Action(type=ActionType.HTTP, params={"method": "GET", "url": "http://localhost/missing"})
     obs = Observation(
         ok=True,
@@ -41,7 +41,7 @@ def test_state_updater_records_negative_http_result_and_recent_memory(tmp_path):
 
 def test_state_updater_promotes_pivot_from_auth_confusion_shell_output(tmp_path):
     updater = _updater(tmp_path)
-    st = State(facts={"orch_step": 4})
+    st = State(orch_step=4)
     action = Action(type=ActionType.SHELL, params={"command": "python recon.py"})
     payload = {
         "auth_hits": [
@@ -61,5 +61,5 @@ def test_state_updater_promotes_pivot_from_auth_confusion_shell_output(tmp_path)
     assert st.promoted_pivot_ids == ["1337"]
     assert "/dashboard" in st.promoted_pivot_targets
     assert "/orders/1337/receipt" in st.promoted_pivot_targets
-    assert st.facts["auth_confusion_runs"] == 1
+    assert st.auth.confusion_runs == 1
     assert "1337" in st.best_http_ids
