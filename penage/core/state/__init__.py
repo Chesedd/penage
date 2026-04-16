@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set
 from penage.core.state.stores import (
     AuthState,
     CurlReconTracking,
+    FilterModel,
     MacroState,
     ResearchTracking,
     SpecialistTracking,
@@ -15,6 +16,7 @@ __all__ = [
     "State",
     "AuthState",
     "CurlReconTracking",
+    "FilterModel",
     "MacroState",
     "ResearchTracking",
     "SpecialistTracking",

