@@ -81,7 +81,7 @@ def test_runtime_factory_builds_optional_policy_and_specialists():
 
     specialists = build_specialists(llm_cfg, components.llm)
     assert specialists is not None
-    assert len(specialists.specialists) == 9
+    assert len(specialists.specialists) == 10
 
     macro_executor = build_macro_executor()
     assert set(macro_executor.registry.keys()) == {
