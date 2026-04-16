@@ -12,12 +12,17 @@ import yaml
 from penage.core.actions import Action, ActionType
 from penage.core.candidates import CandidateAction
 from penage.core.observations import Observation
-from penage.core.state import State
+from penage.core.state import FilterModel, State
 from penage.core.tracer import JsonlTracer
 from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
 from penage.specialists.shared.oob_listener import OobHit, OobListener
+from penage.specialists.shared.payload_mutator import PayloadMutator
+from penage.specialists.shared.reflection_analyzer import (
+    ReflectionContext,
+    ReflectionContextType,
+)
 from penage.tools.http_backend import HttpBackend
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,19 @@ _FALLBACK_MARKERS: tuple[str, ...] = (
 )
 
 _MAX_PHASE3_TOTAL_HTTP = 12
+
+_BASELINE_PROBE_URL = "http://0.0.0.0:1/"
+
+_BLOCKED_STATUS_CODES = frozenset({400, 403, 502})
+
+_SCHEME_RE_BY_PAYLOAD = (
+    ("file://", "file://"),
+    ("gopher://", "gopher://"),
+    ("dict://", "dict://"),
+    ("ftp://", "ftp://"),
+)
+
+_OUTBOUND_LATENCY_RATIO = 2.0
 
 
 @dataclass(slots=True)
@@ -103,16 +121,21 @@ class SsrfSpecialist(AsyncSpecialist):
       1. Target discovery (URL-param heuristic + form/query-string scan).
       2. OOB canary probing (via shared.oob_listener).
       3. Internal-target probing (loopback + cloud metadata + scheme
-         bypass; expected_marker matching).
-      4. LLM/deterministic payload mutation on bypass-failure.
-         (SEPARATE SESSION: этот метод пока raises NotImplementedError
-          если вызван; propose_async до phase 4 не доходит в этой
-          итерации.)
-      5. Evidence gating & finalization.
+         bypass; expected_marker matching). Also records a latency
+         baseline via an unreachable URL for phase 5 hint scoring.
+      4. LLM/deterministic payload mutation via
+         :class:`PayloadMutator` using a synthetic SSRF context and a
+         filter model built from the schemes blocked in phase 3.
+      5. Evidence gating & finalization. Emits verified findings as-is;
+         when only partial signals exist (response markers, 5xx after a
+         scheme-bypass, or an ``outbound_request_suspected`` latency
+         hint), emits an unverified candidate finding.
 
     A finding is verified only if (a) the OOB listener observed an
-    incoming request carrying our token, or (b) a payload from phase 3
-    produced an in-body marker uniquely tied to an internal resource.
+    incoming request carrying our token, or (b) a payload produced an
+    in-body marker uniquely tied to an internal resource. Anything
+    weaker ships as ``verified=False`` so the validation gate
+    (CLAUDE.md invariant #4) stays intact.
     """
 
     name: ClassVar[str] = "ssrf"
@@ -129,6 +152,7 @@ class SsrfSpecialist(AsyncSpecialist):
     min_reserve_http: int = 10
     oob_wait_s: float = 5.0
     max_internal_probes: int = 8
+    max_mutation_payloads: int = 4
 
     _done: bool = field(default=False, init=False)
     _attempted: set[str] = field(default_factory=set, init=False)
@@ -182,17 +206,33 @@ class SsrfSpecialist(AsyncSpecialist):
         if not self._findings:
             return []
         finding = self._findings[-1]
-        if not finding.get("verified"):
-            # Candidate-emission path лежит в Stage 2.8c (phase 4/5).
-            return []
-
         mode = finding.get("mode") or "none"
-        score = 13.0 if mode == "oob" else 11.0
-        tag = "verified"
+
+        if finding.get("verified"):
+            score = 13.0 if mode == "oob" else 11.0
+            kind = finding.get("kind") or "ssrf_finding"
+            tags = ["ssrf", "verified", mode]
+            action = Action(
+                type=ActionType.NOTE,
+                params={"kind": kind, "finding": finding},
+                tags=tags,
+            )
+            return [
+                CandidateAction(
+                    action=action,
+                    source=self.name,
+                    score=score,
+                    cost=0.0,
+                    reason=finding.get("summary") or "SSRF finding",
+                    metadata={"evidence": finding},
+                )
+            ]
+
+        score = 4.0
         action = Action(
             type=ActionType.NOTE,
-            params={"kind": "ssrf_finding", "finding": finding},
-            tags=["ssrf", tag, mode],
+            params={"kind": "ssrf_candidate", "finding": finding},
+            tags=["ssrf", "unverified", mode],
         )
         return [
             CandidateAction(
@@ -200,7 +240,7 @@ class SsrfSpecialist(AsyncSpecialist):
                 source=self.name,
                 score=score,
                 cost=0.0,
-                reason=finding.get("summary") or "SSRF finding",
+                reason=finding.get("summary") or "SSRF candidate",
                 metadata={"evidence": finding},
             )
         ]
@@ -214,6 +254,20 @@ class SsrfSpecialist(AsyncSpecialist):
         config: SpecialistConfig,
     ) -> dict[str, Any] | None:
         host = _host_of(target.url)
+        phase_results: dict[str, Any] = {
+            "oob_token": None,
+            "oob_probe_url": None,
+            "latency_with_oob": None,
+            "baseline_ms": None,
+            "markers_matched": [],
+            "http_status": None,
+            "response_excerpt": "",
+            "blocked_schemes": set(),
+            "http_5xx_after_bypass": False,
+            "mutation_attempts": 0,
+            "mutation_candidates_generated": 0,
+            "step": step,
+        }
 
         # --- Phase 1 -----------------------------------------------------
         self._trace_phase(
@@ -229,26 +283,44 @@ class SsrfSpecialist(AsyncSpecialist):
             http_tool=http_tool,
             step=step,
             host=host,
+            phase_results=phase_results,
         )
         if oob_finding is not None:
-            return oob_finding
+            return self._finalize(target, oob_finding, phase_results)
 
         # --- Phase 3: internal-target probing ---------------------------
         if http_tool.remaining < 1:
             self._note("ssrf:budget_exhausted_before_phase3")
-            return None
+            return self._finalize(target, None, phase_results)
 
         internal_finding = await self._run_internal_phase(
             target=target,
             http_tool=http_tool,
             step=step,
             host=host,
+            phase_results=phase_results,
         )
         if internal_finding is not None:
-            return internal_finding
+            return self._finalize(target, internal_finding, phase_results)
 
-        _ = config  # phase 4 (mutation) uses it — next session.
-        return None
+        # --- Phase 4: payload mutation ----------------------------------
+        mutation_finding: dict[str, Any] | None = None
+        if http_tool.remaining >= self.min_reserve_http:
+            mutation_finding = await self._run_mutation_phase(
+                target=target,
+                http_tool=http_tool,
+                step=step,
+                host=host,
+                config=config,
+                phase_results=phase_results,
+            )
+        else:
+            self._note(
+                f"ssrf:mutation_skipped_budget_low remaining={http_tool.remaining}"
+            )
+
+        # --- Phase 5: finalization --------------------------------------
+        return self._finalize(target, mutation_finding, phase_results)
 
     async def _run_oob_phase(
         self,
@@ -257,6 +329,7 @@ class SsrfSpecialist(AsyncSpecialist):
         http_tool: _BudgetedHttpTool,
         step: int,
         host: str,
+        phase_results: dict[str, Any],
     ) -> dict[str, Any] | None:
         listener = self.oob_listener
         if listener is None or not listener.is_running:
@@ -273,6 +346,9 @@ class SsrfSpecialist(AsyncSpecialist):
             logger.warning("ssrf oob register_token failed: %s", exc)
             self._note(f"ssrf:oob_register_failed:{exc}")
             return None
+
+        phase_results["oob_token"] = token
+        phase_results["oob_probe_url"] = probe_url
 
         self._trace_phase(
             2,
@@ -302,6 +378,9 @@ class SsrfSpecialist(AsyncSpecialist):
             shoot_obs = shoot_result  # type: ignore[assignment]
 
         response_text = _response_text(shoot_obs)
+        latency_ms = _elapsed_ms(shoot_obs)
+        if latency_ms is not None:
+            phase_results["latency_with_oob"] = latency_ms
 
         if isinstance(hit, OobHit):
             self._record_attempt(
@@ -324,11 +403,16 @@ class SsrfSpecialist(AsyncSpecialist):
                     "response_markers": [],
                     "http_status": _status_of(shoot_obs),
                     "response_excerpt": response_text[:500],
+                    "hints": [],
+                    "latency_ms": latency_ms,
+                    "baseline_ms": phase_results.get("baseline_ms"),
                 },
+                "mutation_attempts": 0,
                 "summary": (
                     f"SSRF verified via OOB callback on {target.parameter} "
                     f"(remote={hit.remote_addr})"
                 ),
+                "reason": None,
             }
 
         self._record_attempt(
@@ -346,7 +430,24 @@ class SsrfSpecialist(AsyncSpecialist):
         http_tool: _BudgetedHttpTool,
         step: int,
         host: str,
+        phase_results: dict[str, Any],
     ) -> dict[str, Any] | None:
+        # Baseline probe — one HTTP call with an unreachable URL so phase 5
+        # can compare phase-2 OOB latency against this lower bound.
+        if http_tool.remaining >= 1:
+            baseline_action = _build_probe_action(target, _BASELINE_PROBE_URL)
+            baseline_obs = await http_tool.run(baseline_action)
+            self._phase3_http_used += 1
+            baseline_ms = _elapsed_ms(baseline_obs)
+            if baseline_ms is not None:
+                phase_results["baseline_ms"] = baseline_ms
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=_BASELINE_PROBE_URL,
+                outcome="baseline",
+            )
+
         entries = self._select_internal_payloads(self.max_internal_probes)
         if not entries:
             self._trace_phase(
@@ -361,6 +462,7 @@ class SsrfSpecialist(AsyncSpecialist):
         probes_sent = 0
         markers_matched: list[str] = []
         verified_finding: dict[str, Any] | None = None
+        blocked_schemes: set[str] = phase_results["blocked_schemes"]
 
         for entry in entries:
             if self._phase3_http_used >= _MAX_PHASE3_TOTAL_HTTP:
@@ -380,6 +482,26 @@ class SsrfSpecialist(AsyncSpecialist):
             probes_sent += 1
 
             text = _response_text(obs)
+            status = _status_of(obs)
+            phase_results["http_status"] = status
+            if text:
+                phase_results["response_excerpt"] = text[:500]
+
+            scheme = _scheme_of(payload)
+            category = str(entry.get("category") or "")
+            if (
+                scheme is not None
+                and category == "scheme-bypass"
+                and status in _BLOCKED_STATUS_CODES
+            ):
+                blocked_schemes.add(scheme)
+            if (
+                category == "scheme-bypass"
+                and status is not None
+                and 500 <= status < 600
+            ):
+                phase_results["http_5xx_after_bypass"] = True
+
             matched = _find_markers(text, expected_s)
 
             if matched:
@@ -397,13 +519,18 @@ class SsrfSpecialist(AsyncSpecialist):
                         "mode": "internal_marker",
                         "oob_hit": None,
                         "response_markers": list(matched),
-                        "http_status": _status_of(obs),
+                        "http_status": status,
                         "response_excerpt": text[:500],
+                        "hints": [],
+                        "latency_ms": _elapsed_ms(obs),
+                        "baseline_ms": phase_results.get("baseline_ms"),
                     },
+                    "mutation_attempts": 0,
                     "summary": (
                         f"SSRF leaked internal marker on {target.parameter} "
                         f"(payload_id={entry.get('id')}, markers={matched})"
                     ),
+                    "reason": None,
                 }
             elif obs.ok:
                 outcome = "no_signal"
@@ -419,6 +546,8 @@ class SsrfSpecialist(AsyncSpecialist):
             if verified_finding is not None:
                 break
 
+        phase_results["markers_matched"] = list(markers_matched)
+
         self._trace_phase(
             3,
             "internal_probing",
@@ -427,6 +556,8 @@ class SsrfSpecialist(AsyncSpecialist):
             extra={
                 "probes_sent": probes_sent,
                 "markers_matched": list(markers_matched),
+                "blocked_schemes": sorted(blocked_schemes),
+                "baseline_ms": phase_results.get("baseline_ms"),
             },
         )
         return verified_finding
@@ -438,10 +569,264 @@ class SsrfSpecialist(AsyncSpecialist):
         http_tool: _BudgetedHttpTool,
         step: int,
         host: str,
+        config: SpecialistConfig,
+        phase_results: dict[str, Any],
     ) -> dict[str, Any] | None:
-        # TODO: Implemented in follow-up (2.8c).
-        _ = (target, http_tool, step, host)
-        raise NotImplementedError("SSRF phase 4 (payload mutation) ships in 2.8c")
+        if self.llm_client is None:
+            return None
+
+        context = ReflectionContext(context_type=ReflectionContextType.SSRF_URL_PARAM)
+
+        blocked_schemes: set[str] = phase_results.get("blocked_schemes") or set()
+        transformed: dict[str, str] = {s: "blocked" for s in blocked_schemes}
+        filter_model = FilterModel(
+            parameter=target.parameter,
+            channel=target.channel,
+            transformed_chars=transformed,
+        )
+
+        mutator = PayloadMutator(
+            llm_client=self.llm_client,
+            payload_library_path=self.payload_library_path,
+        )
+
+        max_candidates = int(getattr(config, "max_candidates", 5) or 5)
+        try:
+            payloads = await mutator.mutate(
+                context,
+                filter_model,
+                max_candidates=max(1, min(max_candidates, 5)),
+            )
+        except Exception as exc:  # LEGACY: mutator already swallows LLM errors
+            logger.warning("ssrf mutation call failed: %s", exc)
+            self._note(f"ssrf:phase4_error:{exc}")
+            payloads = []
+
+        phase_results["mutation_candidates_generated"] = len(payloads)
+
+        fired = 0
+        verified_finding: dict[str, Any] | None = None
+        listener = self.oob_listener
+        oob_token: str | None = phase_results.get("oob_token")
+
+        for payload in payloads[: self.max_mutation_payloads]:
+            if http_tool.remaining < 1:
+                self._note("ssrf:mutation_budget_exhausted")
+                break
+
+            probe_action = _build_probe_action(target, payload)
+            obs = await http_tool.run(probe_action)
+            fired += 1
+
+            text = _response_text(obs)
+            status = _status_of(obs)
+            if text:
+                phase_results["response_excerpt"] = text[:500]
+            if status is not None:
+                phase_results["http_status"] = status
+
+            matched = _find_markers(text, None)
+
+            outcome = "no_signal"
+
+            if listener is not None and listener.is_running and oob_token:
+                try:
+                    hit = await listener.wait_for_hit(oob_token, 0.1)
+                except Exception as exc:
+                    logger.warning("ssrf phase4 oob wait failed: %s", exc)
+                    hit = None
+                if isinstance(hit, OobHit):
+                    outcome = "verified_oob"
+                    self._record_attempt(
+                        host=host,
+                        parameter=target.parameter,
+                        payload=payload,
+                        outcome=outcome,
+                    )
+                    phase_results["mutation_attempts"] = fired
+                    verified_finding = {
+                        "verified": True,
+                        "kind": "ssrf_oob",
+                        "mode": "oob",
+                        "parameter": target.parameter,
+                        "payload": payload,
+                        "channel": target.channel,
+                        "url": target.url,
+                        "evidence": {
+                            "mode": "oob",
+                            "oob_hit": {"remote_addr": hit.remote_addr, "path": hit.path},
+                            "response_markers": [],
+                            "http_status": status,
+                            "response_excerpt": text[:500],
+                            "hints": [],
+                            "latency_ms": _elapsed_ms(obs),
+                            "baseline_ms": phase_results.get("baseline_ms"),
+                        },
+                        "mutation_attempts": fired,
+                        "summary": (
+                            f"SSRF verified via OOB callback (mutation) on "
+                            f"{target.parameter} (remote={hit.remote_addr})"
+                        ),
+                        "reason": None,
+                    }
+                    break
+
+            if matched:
+                outcome = "verified_metadata"
+                phase_results["markers_matched"] = list(
+                    dict.fromkeys((phase_results.get("markers_matched") or []) + matched)
+                )
+                phase_results["mutation_attempts"] = fired
+                verified_finding = {
+                    "verified": True,
+                    "kind": "ssrf_metadata_leak",
+                    "mode": "internal_marker",
+                    "parameter": target.parameter,
+                    "payload": payload,
+                    "channel": target.channel,
+                    "url": target.url,
+                    "evidence": {
+                        "mode": "internal_marker",
+                        "oob_hit": None,
+                        "response_markers": list(matched),
+                        "http_status": status,
+                        "response_excerpt": text[:500],
+                        "hints": [],
+                        "latency_ms": _elapsed_ms(obs),
+                        "baseline_ms": phase_results.get("baseline_ms"),
+                    },
+                    "mutation_attempts": fired,
+                    "summary": (
+                        f"SSRF leaked internal marker on {target.parameter} "
+                        f"via mutated payload (markers={matched})"
+                    ),
+                    "reason": None,
+                }
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=payload,
+                    outcome=outcome,
+                )
+                break
+
+            if not obs.ok:
+                outcome = "error"
+
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=payload,
+                outcome=outcome,
+            )
+
+        phase_results["mutation_attempts"] = fired
+        self._trace_phase(
+            4,
+            "payload_mutation",
+            step=step,
+            target=target,
+            extra={
+                "candidates_generated": len(payloads),
+                "payloads_fired": fired,
+            },
+        )
+        return verified_finding
+
+    def _finalize(
+        self,
+        target: _SsrfTarget,
+        verified_finding: dict[str, Any] | None,
+        phase_results: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if verified_finding is not None:
+            self._trace_phase(
+                5,
+                "evidence_finalization",
+                step=int(phase_results.get("step") or 0),
+                target=target,
+                extra={
+                    "verified": True,
+                    "mode": verified_finding.get("mode"),
+                    "reason": verified_finding.get("reason"),
+                },
+            )
+            return verified_finding
+
+        markers = list(phase_results.get("markers_matched") or [])
+        status = phase_results.get("http_status")
+        http_5xx = bool(phase_results.get("http_5xx_after_bypass"))
+        latency_oob = phase_results.get("latency_with_oob")
+        baseline_ms = phase_results.get("baseline_ms")
+
+        hints: list[str] = []
+        if (
+            isinstance(latency_oob, int)
+            and isinstance(baseline_ms, int)
+            and baseline_ms > 0
+            and latency_oob > _OUTBOUND_LATENCY_RATIO * baseline_ms
+        ):
+            hints.append("outbound_request_suspected")
+
+        has_signal = bool(markers) or http_5xx or bool(hints)
+        if not has_signal:
+            self._trace_phase(
+                5,
+                "evidence_finalization",
+                step=int(phase_results.get("step") or 0),
+                target=target,
+                extra={"verified": False, "mode": "none", "reason": "no_signal"},
+            )
+            return None
+
+        mode = "hints_only"
+        reason_bits: list[str] = []
+        if markers:
+            mode = "internal_marker"
+            reason_bits.append(f"response_markers={markers}")
+        elif http_5xx:
+            mode = "internal_marker"
+            reason_bits.append(f"5xx_after_scheme_bypass status={status}")
+        if hints:
+            reason_bits.append("outbound_request_suspected")
+        reason = "; ".join(reason_bits) or "partial_signal"
+
+        mutation_attempts = int(phase_results.get("mutation_attempts") or 0)
+
+        finding = {
+            "verified": False,
+            "kind": "ssrf_candidate",
+            "mode": mode,
+            "parameter": target.parameter,
+            "payload": phase_results.get("oob_probe_url") or "",
+            "channel": target.channel,
+            "url": target.url,
+            "evidence": {
+                "mode": mode,
+                "oob_hit": None,
+                "response_markers": markers,
+                "http_status": status,
+                "response_excerpt": str(phase_results.get("response_excerpt") or ""),
+                "hints": hints,
+                "latency_ms": latency_oob if isinstance(latency_oob, int) else None,
+                "baseline_ms": baseline_ms if isinstance(baseline_ms, int) else None,
+            },
+            "mutation_attempts": mutation_attempts,
+            "summary": (
+                f"SSRF candidate on {target.parameter} (mode={mode}, "
+                f"mutation_attempts={mutation_attempts})"
+            ),
+            "reason": reason,
+        }
+
+        self._trace_phase(
+            5,
+            "evidence_finalization",
+            step=int(phase_results.get("step") or 0),
+            target=target,
+            extra={"verified": False, "mode": mode, "reason": reason},
+        )
+        return finding
 
     # ---- target discovery ----------------------------------------------
 
@@ -657,6 +1042,23 @@ def _host_of(url: str) -> str:
         return (urlparse(url).netloc or "").lower()
     except Exception:
         return ""
+
+
+def _elapsed_ms(obs: Observation) -> int | None:
+    if obs.elapsed_ms is None:
+        return None
+    try:
+        return int(obs.elapsed_ms)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scheme_of(payload: str) -> str | None:
+    low = (payload or "").lower()
+    for prefix, scheme in _SCHEME_RE_BY_PAYLOAD:
+        if low.startswith(prefix):
+            return scheme
+    return None
 
 
 def _find_markers(text: str, expected: str | None) -> list[str]:

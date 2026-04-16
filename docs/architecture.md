@@ -110,6 +110,12 @@ Examples:
 - `AuthSessionConfusionSpecialist`
 - `CurlReconSpecialist`
 - `SandboxSmokeSpecialist`
+- `SsrfSpecialist` — five-phase SSRF probe (OOB canary via
+  `shared.OobListener`, internal-target probing with latency
+  baseline, LLM payload mutation, evidence-gated finalization).
+  Emits `ssrf_oob` / `ssrf_metadata_leak` verified findings or an
+  `ssrf_candidate` unverified finding (score 4.0) when only partial
+  signals survive (5xx after scheme-bypass, outbound-latency hint).
 
 Manager and pipeline:
 
