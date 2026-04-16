@@ -43,7 +43,7 @@ async def test_orchestrator_executes_http_plan_and_records_validated_signal(tmp_
     tracer = JsonlTracer(tmp_path / "trace.jsonl", episode_id="test")
     orchestrator = Orchestrator(llm=llm, tools=tools, tracer=tracer)
 
-    state = await orchestrator.run_episode(
+    state, tracker = await orchestrator.run_episode(
         user_prompt="get the flag",
         state=State(base_url="http://localhost"),
         max_steps=1,
@@ -57,3 +57,5 @@ async def test_orchestrator_executes_http_plan_and_records_validated_signal(tmp_
     assert state.validation_validated_count == 1
     assert state.last_validation is not None
     assert state.last_validation["kind"] == "flag_capture"
+    assert tracker.total_tool_calls == 1
+    assert tracker.total_llm_calls >= 1

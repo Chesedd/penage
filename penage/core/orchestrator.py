@@ -13,6 +13,7 @@ from penage.core.state import State
 from penage.core.state_updates import StateUpdater
 from penage.core.tracer import JsonlTracer
 from penage.core.url_guard import UrlGuard
+from penage.core.usage import EarlyStopThresholds, UsageTracker
 from penage.llm.base import LLMClient
 from penage.macros.base import MacroExecutor
 from penage.policy.base import PolicyLayer
@@ -100,10 +101,13 @@ class Orchestrator:
         actions_per_step: int = 1,
         max_http_requests: Optional[int] = 30,
         max_total_text_len: Optional[int] = 200_000,
-    ) -> State:
+        early_stop: Optional[EarlyStopThresholds] = None,
+    ) -> tuple[State, UsageTracker]:
         st = state or State()
+        tracker = UsageTracker()
         self.tracer.record_note("episode_start", step=0)
 
+        episode_stopped = False
         for step in range(1, max_steps + 1):
             st.orch_step = step
 
@@ -123,6 +127,14 @@ class Orchestrator:
                     self.tracer.record_note(f"stop_condition: {reason}", step=step)
                     break
 
+            if early_stop is not None:
+                stop_reason = tracker.check_early_stop(early_stop)
+                if stop_reason:
+                    self.tracer.record_note(f"early_stop: {stop_reason}", step=step)
+                    st.notes.append(f"early_stop:{stop_reason}")
+                    episode_stopped = True
+                    break
+
             specialist_candidates = []
             if self.specialists:
                 specialist_candidates = await self.specialists.propose_all_async(st)
@@ -139,6 +151,11 @@ class Orchestrator:
             self.state_updater.sync_research_memory_from_facts(st)
 
             planning = await self.planner.choose_actions(step=step, user_prompt=user_prompt, state=st)
+
+            for llm_resp in planning.llm_responses:
+                token_usage = self.llm.token_usage(llm_resp)
+                tracker.record_llm_call("planner", self.llm.provider_name, token_usage)
+
             if planning.note:
                 self.tracer.record_note(planning.note, step=step)
             if planning.stop_reason:
@@ -211,8 +228,10 @@ class Orchestrator:
 
                 self.tracer.record_observation(obs, step=step)
 
+                duration_s = (obs.elapsed_ms / 1000.0) if obs.elapsed_ms is not None else 0.0
                 if obs.elapsed_ms is not None:
                     st.tool_elapsed_ms_total += int(obs.elapsed_ms)
+                tracker.record_tool_call("planner", duration_s)
 
                 self.tracer.record_note(
                     f"usage:llm={st.llm_calls} tools={st.tool_calls_total} http={st.tool_calls_http} sb={st.tool_calls_sandbox} ms={st.tool_elapsed_ms_total}",
@@ -223,4 +242,4 @@ class Orchestrator:
                 self.state_updater.validate_and_record(st, a, obs, step=step)
 
         self.tracer.record_note("episode_end", step=max_steps)
-        return st
+        return st, tracker

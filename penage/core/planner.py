@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
 from penage.core.actions import Action, ActionType
@@ -9,7 +9,7 @@ from penage.core.planner_context import build_planner_context
 from penage.core.state import State
 from penage.core.state_helpers import action_family, path_only
 from penage.core.url_guard import UrlGuard
-from penage.llm.base import LLMClient, LLMMessage
+from penage.llm.base import LLMClient, LLMMessage, LLMResponse
 from penage.utils.fingerprint import action_fingerprint
 from penage.utils.jsonx import parse_json_object
 
@@ -24,6 +24,7 @@ class PlannerDecision:
     reason: Optional[str] = None
     note: Optional[str] = None
     stop_reason: Optional[str] = None
+    llm_responses: list[LLMResponse] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -41,26 +42,30 @@ class Planner:
         user_prompt: str,
         state: State,
     ) -> PlannerDecision:
-        plan_obj = await self._plan_json(
+        responses: list[LLMResponse] = []
+
+        plan_obj, resp1 = await self._plan_json(
             step=step,
             user_prompt=user_prompt,
             state=state,
             extra_constraint=None,
         )
+        if resp1 is not None:
+            responses.append(resp1)
         if plan_obj is None:
-            return PlannerDecision(actions=[], reason="planner_returned_invalid_json")
+            return PlannerDecision(actions=[], reason="planner_returned_invalid_json", llm_responses=responses)
 
         note = str(plan_obj.get("note") or "").strip() or None
 
         if plan_obj.get("stop"):
             reason = str(plan_obj.get("stop_reason") or "planner_stop")
-            return PlannerDecision(actions=[], reason=f"planner_stop:{reason}", note=note, stop_reason=reason)
+            return PlannerDecision(actions=[], reason=f"planner_stop:{reason}", note=note, stop_reason=reason, llm_responses=responses)
 
         actions = self._pick_many_from_plan(plan_obj, state)
         if actions:
-            return PlannerDecision(actions=actions, note=note)
+            return PlannerDecision(actions=actions, note=note, llm_responses=responses)
 
-        plan_obj2 = await self._plan_json(
+        plan_obj2, resp2 = await self._plan_json(
             step=step,
             user_prompt=user_prompt,
             state=state,
@@ -74,14 +79,16 @@ class Planner:
             ),
             compact=True,
         )
+        if resp2 is not None:
+            responses.append(resp2)
         if plan_obj2 is None:
-            return PlannerDecision(actions=[], reason="planner_returned_invalid_json_after_replan", note=note)
+            return PlannerDecision(actions=[], reason="planner_returned_invalid_json_after_replan", note=note, llm_responses=responses)
 
         actions2 = self._pick_many_from_plan(plan_obj2, state)
         if actions2:
-            return PlannerDecision(actions=actions2, note=note)
+            return PlannerDecision(actions=actions2, note=note, llm_responses=responses)
 
-        return PlannerDecision(actions=[], reason="no_actions_after_guard_or_repeat_filter", note=note)
+        return PlannerDecision(actions=[], reason="no_actions_after_guard_or_repeat_filter", note=note, llm_responses=responses)
 
     async def _plan_json(
         self,
@@ -91,18 +98,18 @@ class Planner:
         state: State,
         extra_constraint: Optional[str],
         compact: bool = False,
-    ) -> Optional[dict]:
-        plan_text = await self._plan(
+    ) -> tuple[Optional[dict], Optional[LLMResponse]]:
+        resp = await self._plan(
             step=step,
             user_prompt=user_prompt,
             state=state,
             extra_constraint=extra_constraint,
             compact=compact,
         )
-        plan_obj = parse_json_object(plan_text)
+        plan_obj = parse_json_object(resp.text)
         if not isinstance(plan_obj, dict):
-            return None
-        return plan_obj
+            return None, resp
+        return plan_obj, resp
 
     async def _plan(
         self,
@@ -112,7 +119,7 @@ class Planner:
         state: State,
         extra_constraint: Optional[str],
         compact: bool = False,
-    ) -> str:
+    ) -> LLMResponse:
         if self.research_memory_syncer is not None:
             self.research_memory_syncer.sync_research_memory_from_facts(state)
 
@@ -130,8 +137,7 @@ class Planner:
         ]
 
         state.llm_calls += 1
-        resp = await self.llm.generate(messages)
-        return resp.text
+        return await self.llm.generate(messages)
 
     def _pick_many_from_plan(self, plan_obj: dict, state: State) -> list[Action]:
         raw_actions = plan_obj.get("actions") or []
