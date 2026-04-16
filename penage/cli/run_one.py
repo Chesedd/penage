@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-cost", type=float, default=0.30, help="Stop episode after this USD API cost")
     p.add_argument("--early-stop-seconds", type=float, default=300.0, help="Stop episode after this many wall-clock seconds")
 
+    p.add_argument("--memory-db", default="runs/memory.sqlite", help="Path to persistent memory SQLite DB (use ':memory:' for ephemeral)")
+
     p.add_argument("--experiment-tag", default="", help="Optional experiment tag for A/B runs")
 
     return p.parse_args()
@@ -110,6 +112,7 @@ async def main_async() -> int:
     finally:
         await bundle.tools.aclose()
         await bundle.llm.aclose()
+        bundle.memory.close()
 
 
 def main() -> None:

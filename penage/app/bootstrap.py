@@ -7,6 +7,7 @@ from penage.app.runtime_factory import build_runtime_components
 from penage.core.orchestrator import Orchestrator
 from penage.core.tracer import JsonlTracer
 from penage.llm.base import LLMClient
+from penage.memory.store import MemoryStore
 from penage.tools.runner import ToolRunner
 
 
@@ -16,6 +17,7 @@ class BootstrapBundle:
     tools: ToolRunner
     llm: LLMClient
     orchestrator: Orchestrator
+    memory: MemoryStore
 
 
 def build_runtime(cfg: RuntimeConfig, tracer: JsonlTracer) -> BootstrapBundle:
@@ -25,4 +27,5 @@ def build_runtime(cfg: RuntimeConfig, tracer: JsonlTracer) -> BootstrapBundle:
         tools=components.tools,
         llm=components.llm,
         orchestrator=components.orchestrator,
+        memory=components.memory,
     )

@@ -16,9 +16,11 @@ from penage.core.url_guard import UrlGuard
 from penage.core.usage import EarlyStopThresholds, UsageTracker
 from penage.llm.base import LLMClient
 from penage.macros.base import MacroExecutor
+from penage.memory.store import MemoryStore
 from penage.policy.base import PolicyLayer
 from penage.specialists.manager import SpecialistManager
 from penage.tools.runner import ToolRunner
+from penage.utils.fingerprint import action_fingerprint
 from penage.validation.base import EvidenceValidator
 
 
@@ -40,6 +42,7 @@ class Orchestrator:
     macro_executor: Optional[MacroExecutor] = None
     state_updater: Optional[StateUpdater] = None
     planner: Optional[Planner] = None
+    memory: Optional[MemoryStore] = None
 
     system_prompt: str = (
         "You are a planner. Return ONLY a JSON object with key 'actions' "
@@ -241,5 +244,44 @@ class Orchestrator:
                 self.state_updater.update_state(st, a, obs)
                 self.state_updater.validate_and_record(st, a, obs, step=step)
 
+                if self.memory is not None:
+                    self._record_memory_attempt(a, obs, st)
+
         self.tracer.record_note("episode_end", step=max_steps)
         return st, tracker
+
+    def _record_memory_attempt(self, action: Action, obs: Observation, st: State) -> None:
+        from urllib.parse import urlparse
+
+        params = action.params or {}
+        host = ""
+        parameter = ""
+
+        if action.type == ActionType.HTTP:
+            url = str(params.get("url") or "")
+            try:
+                parsed = urlparse(url)
+                host = (parsed.netloc or "").lower()
+                parameter = parsed.path or "/"
+            except Exception:  # LEGACY: URL parse can fail on malformed LLM output
+                host = ""
+                parameter = url
+
+        payload_fp = action_fingerprint(action)
+
+        if obs.ok:
+            if st.last_validation is not None and st.last_validation.get("level") == "validated":
+                outcome = f"validated:{st.last_validation.get('kind') or ''}"
+            else:
+                status = obs.data.get("status_code") if isinstance(obs.data, dict) else None
+                outcome = f"ok:{status}" if status is not None else "ok"
+        else:
+            outcome = f"error:{obs.error or 'unknown'}"
+
+        self.memory.record_attempt(
+            episode_id=self.tracer.episode_id,
+            host=host,
+            parameter=parameter,
+            payload=payload_fp,
+            outcome=outcome,
+        )

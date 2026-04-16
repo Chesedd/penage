@@ -12,6 +12,7 @@ from penage.core.url_guard import UrlGuard
 from penage.llm.base import LLMClient
 from penage.llm.ollama import OllamaClient
 from penage.macros.base import MacroExecutor
+from penage.memory.store import MemoryStore
 from penage.macros.follow_authenticated_branch import FollowAuthenticatedBranchMacro
 from penage.macros.probe_resource_family import ProbeResourceFamilyMacro
 from penage.macros.replay_auth_session import ReplayAuthSessionMacro
@@ -39,6 +40,7 @@ class RuntimeComponents:
     tools: ToolRunner
     llm: LLMClient
     orchestrator: Orchestrator
+    memory: MemoryStore
 
 
 def rewrite_base_url_for_docker(base_url: str) -> str:
@@ -123,7 +125,9 @@ def build_macro_executor() -> MacroExecutor:
     return ex
 
 
-def build_specialists(cfg: RuntimeConfig, llm: LLMClient) -> SpecialistManager | None:
+def build_specialists(
+    cfg: RuntimeConfig, llm: LLMClient, *, memory: MemoryStore | None = None
+) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
 
@@ -140,6 +144,7 @@ def build_specialists(cfg: RuntimeConfig, llm: LLMClient) -> SpecialistManager |
             SqliSpecialist(),
         ],
         llm=llm,
+        memory=memory,
     )
 
 
@@ -149,12 +154,17 @@ def build_policy(cfg: RuntimeConfig) -> GctrLitePolicy | None:
     return GctrLitePolicy()
 
 
+def build_memory(cfg: RuntimeConfig) -> MemoryStore:
+    return MemoryStore(cfg.memory_db_path)
+
+
 def build_orchestrator(
     cfg: RuntimeConfig,
     *,
     llm: LLMClient,
     tools: ToolRunner,
     tracer: JsonlTracer,
+    memory: MemoryStore | None = None,
 ) -> Orchestrator:
     return Orchestrator(
         llm=llm,
@@ -163,8 +173,9 @@ def build_orchestrator(
         guard=ExecutionGuard(allowed=allowed_action_types_for_mode(cfg.mode)),
         url_guard=UrlGuard(block_static_assets=(not cfg.allow_static)),
         policy=build_policy(cfg),
-        specialists=build_specialists(cfg, llm),
+        specialists=build_specialists(cfg, llm, memory=memory),
         macro_executor=build_macro_executor(),
+        memory=memory,
     )
 
 
@@ -172,11 +183,13 @@ def build_runtime_components(cfg: RuntimeConfig, *, tracer: JsonlTracer) -> Runt
     sandbox = build_sandbox(cfg)
     tools = build_tools(cfg, sandbox=sandbox)
     llm = build_llm(cfg)
-    orchestrator = build_orchestrator(cfg, llm=llm, tools=tools, tracer=tracer)
+    memory = build_memory(cfg)
+    orchestrator = build_orchestrator(cfg, llm=llm, tools=tools, tracer=tracer, memory=memory)
     return RuntimeComponents(
         base_url=compute_base_url(cfg),
         sandbox=sandbox,
         tools=tools,
         llm=llm,
         orchestrator=orchestrator,
+        memory=memory,
     )

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from penage.core.candidates import CandidateAction
 from penage.core.state import State
 from penage.llm.base import LLMClient
+from penage.memory.store import MemoryStore
 from penage.specialists.base import Specialist, SpecialistConfig
 from penage.specialists.pipeline import CandidatePool
 from penage.specialists.proposal_runner import SpecialistProposalRunner
@@ -16,6 +17,7 @@ class SpecialistManager:
     specialists: List[Specialist] = field(default_factory=list)
     configs: Dict[str, SpecialistConfig] = field(default_factory=dict)
     llm: Optional[LLMClient] = None
+    memory: Optional[MemoryStore] = None
     proposal_runner: SpecialistProposalRunner = field(init=False)
     candidate_pool: CandidatePool = field(init=False)
 
