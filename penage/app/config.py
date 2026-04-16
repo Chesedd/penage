@@ -10,6 +10,12 @@ from penage.core.guard import RunMode
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     base_url: str
+
+    # LLM provider selection
+    llm_provider: str
+    llm_model: str
+
+    # Ollama-specific (kept for backward compatibility and used when provider=ollama)
     ollama_model: str
     ollama_url: str
 
@@ -38,10 +44,22 @@ class RuntimeConfig:
 def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
     summary_path = Path(args.summary_json) if getattr(args, "summary_json", "") else None
 
+    provider = str(getattr(args, "llm_provider", "ollama") or "ollama")
+    llm_model = str(getattr(args, "llm_model", "") or "")
+
+    ollama_model = str(getattr(args, "ollama_model", "") or "")
+    ollama_url = str(getattr(args, "ollama_url", "") or "http://localhost:11434")
+
+    # Backward-compat: if provider is ollama and llm_model is empty, fall back to --ollama-model
+    if provider == "ollama" and not llm_model:
+        llm_model = ollama_model
+
     return RuntimeConfig(
         base_url=str(args.base_url),
-        ollama_model=str(args.ollama_model),
-        ollama_url=str(args.ollama_url),
+        llm_provider=provider,
+        llm_model=llm_model,
+        ollama_model=ollama_model,
+        ollama_url=ollama_url,
         trace_path=Path(args.trace),
         summary_path=summary_path,
         mode=RunMode(args.mode),

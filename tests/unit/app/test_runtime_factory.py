@@ -23,6 +23,8 @@ from penage.sandbox.null import NullSandbox
 def _cfg(**overrides) -> RuntimeConfig:
     base = dict(
         base_url="http://localhost:8080",
+        llm_provider="ollama",
+        llm_model="llama3.1",
         ollama_model="llama3.1",
         ollama_url="http://localhost:11434",
         trace_path=Path("trace.jsonl"),

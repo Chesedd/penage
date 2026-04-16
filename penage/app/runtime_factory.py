@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
 
 from penage.app.config import RuntimeConfig
+from penage.core.errors import LLMResponseError
 from penage.core.guard import ExecutionGuard, allowed_action_types_for_mode
 from penage.core.orchestrator import Orchestrator
 from penage.core.tracer import JsonlTracer
 from penage.core.url_guard import UrlGuard
+from penage.llm.base import LLMClient
 from penage.llm.ollama import OllamaClient
 from penage.macros.base import MacroExecutor
 from penage.macros.follow_authenticated_branch import FollowAuthenticatedBranchMacro
@@ -35,7 +37,7 @@ class RuntimeComponents:
     base_url: str
     sandbox: Sandbox
     tools: ToolRunner
-    llm: OllamaClient
+    llm: LLMClient
     orchestrator: Orchestrator
 
 
@@ -93,8 +95,24 @@ def build_tools(cfg: RuntimeConfig, *, sandbox: Sandbox) -> ToolRunner:
     )
 
 
-def build_llm(cfg: RuntimeConfig) -> OllamaClient:
-    return OllamaClient(model=cfg.ollama_model, base_url=cfg.ollama_url, max_retries=1)
+def build_llm(cfg: RuntimeConfig) -> LLMClient:
+    provider = (cfg.llm_provider or "ollama").lower()
+
+    if provider == "ollama":
+        model = cfg.llm_model or cfg.ollama_model
+        if not model:
+            raise LLMResponseError("ollama provider requires --llm-model or --ollama-model")
+        return OllamaClient(model=model, base_url=cfg.ollama_url, max_retries=1)
+
+    if provider == "anthropic":
+        from penage.llm.anthropic import AnthropicClient, DEFAULT_MODEL as ANTHROPIC_DEFAULT
+        return AnthropicClient(model=cfg.llm_model or ANTHROPIC_DEFAULT)
+
+    if provider == "openai":
+        from penage.llm.openai import OpenAIClient, DEFAULT_MODEL as OPENAI_DEFAULT
+        return OpenAIClient(model=cfg.llm_model or OPENAI_DEFAULT)
+
+    raise LLMResponseError(f"unknown llm provider: {provider}")
 
 
 def build_macro_executor() -> MacroExecutor:
@@ -105,7 +123,7 @@ def build_macro_executor() -> MacroExecutor:
     return ex
 
 
-def build_specialists(cfg: RuntimeConfig, llm: OllamaClient) -> SpecialistManager | None:
+def build_specialists(cfg: RuntimeConfig, llm: LLMClient) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
 
@@ -134,7 +152,7 @@ def build_policy(cfg: RuntimeConfig) -> GctrLitePolicy | None:
 def build_orchestrator(
     cfg: RuntimeConfig,
     *,
-    llm: OllamaClient,
+    llm: LLMClient,
     tools: ToolRunner,
     tracer: JsonlTracer,
 ) -> Orchestrator:

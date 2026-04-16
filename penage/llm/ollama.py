@@ -1,47 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import httpx
 
 from penage.core.errors import LLMResponseError
 from penage.llm.base import LLMClient, LLMMessage, LLMResponse
-
-_JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
-
-_JSON_HINTS = (
-    "return only json",
-    "return only a json object",
-    "return json",
-    "output schema",
-    "\"actions\"",
-    "'actions'",
-    "valid json object",
-)
-
-
-def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    m = _JSON_FENCE_RE.search(text)
-    if m:
-        candidate = m.group(1)
-        try:
-            return json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            return None
-
-    if "{" in text and "}" in text:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-            try:
-                return json.loads(candidate)
-            except (json.JSONDecodeError, ValueError):
-                return None
-    return None
+from penage.llm.json_robust import extract_first_json_object, should_force_json
 
 
 def _clip_middle(text: str, limit: int) -> str:
@@ -54,6 +21,8 @@ def _clip_middle(text: str, limit: int) -> str:
 
 @dataclass(slots=True)
 class OllamaClient(LLMClient):
+
+    provider_name: ClassVar[str] = "ollama"
 
     model: str
     base_url: str = "http://localhost:11434"
@@ -94,8 +63,17 @@ class OllamaClient(LLMClient):
         if not self.prefer_json_mode:
             return False
 
-        joined = "\n".join((m.content or "") for m in messages).lower()
-        return any(h in joined for h in _JSON_HINTS)
+        joined = "\n".join((m.content or "") for m in messages)
+        return should_force_json(joined)
+
+    def token_usage(self, response: LLMResponse) -> Dict[str, int]:
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        return {
+            "input_tokens": int(raw.get("prompt_eval_count") or 0),
+            "output_tokens": int(raw.get("eval_count") or 0),
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+        }
 
     def _budget_messages(self, messages: List[LLMMessage]) -> List[LLMMessage]:
         """

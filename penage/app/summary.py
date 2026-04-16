@@ -12,6 +12,8 @@ def build_episode_summary(cfg: RuntimeConfig, trace_path: Path, st: State, *, ba
             "tag": cfg.experiment_tag or None,
             "trace_path": str(trace_path),
             "base_url": base_url,
+            "llm_provider": cfg.llm_provider,
+            "llm_model": cfg.llm_model,
             "ollama_model": cfg.ollama_model,
             "ollama_url": cfg.ollama_url,
             "mode": cfg.mode.value,

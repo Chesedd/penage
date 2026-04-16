@@ -18,6 +18,8 @@ class LLMResponse:
 
 
 class LLMClient(Protocol):
+    provider_name: str
+
     async def generate(
         self,
         messages: List[LLMMessage],
@@ -25,3 +27,10 @@ class LLMClient(Protocol):
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse: ...
+
+    def token_usage(self, response: LLMResponse) -> Dict[str, int]:
+        """Return {input_tokens, output_tokens, cached_tokens, reasoning_tokens}.
+
+        Unsupported fields return 0 rather than being omitted.
+        """
+        ...
