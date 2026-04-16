@@ -49,9 +49,8 @@ def build_planner_context(
     limits = PlannerContextLimits.for_mode(compact=compact)
     context_lines = [f"Step={step}"]
 
-    base_url = state.facts.get("base_url")
-    if base_url:
-        context_lines.append(f"BaseURL={base_url}")
+    if state.base_url:
+        context_lines.append(f"BaseURL={state.base_url}")
 
     if state.last_http_status is not None:
         context_lines.append(f"LastHTTPStatus={state.last_http_status}")
@@ -130,7 +129,7 @@ def build_planner_context(
             + json.dumps(state.validation_results[-min(len(state.validation_results), limits.val_limit):], ensure_ascii=False)
         )
 
-    pivot_active = int(state.facts.get("orch_step") or 0) <= int(getattr(state, "promoted_pivot_active_until_step", 0) or 0)
+    pivot_active = state.orch_step <= state.promoted_pivot_active_until_step
     if pivot_active and state.promoted_pivot_targets:
         context_lines.append(f"PromotedPivotTargets={state.promoted_pivot_targets[:8]}")
     if pivot_active and state.promoted_pivot_ids:
@@ -140,21 +139,17 @@ def build_planner_context(
     if pivot_active and state.promoted_pivot_reason:
         context_lines.append(f"PromotedPivotReason={state.promoted_pivot_reason}")
 
-    auth_stats = state.facts.get("auth_confusion_last_stats") or {}
-    if isinstance(auth_stats, dict) and auth_stats:
-        context_lines.append("AuthConfusionLastStats=" + json.dumps(auth_stats, ensure_ascii=False))
+    if state.auth.confusion_last_stats:
+        context_lines.append("AuthConfusionLastStats=" + json.dumps(state.auth.confusion_last_stats, ensure_ascii=False))
 
-    auth_hits = state.facts.get("auth_confusion_last_hits_preview") or []
-    if isinstance(auth_hits, list) and auth_hits:
-        context_lines.append("AuthConfusionHitsPreview=" + json.dumps(auth_hits[:4], ensure_ascii=False))
+    if state.auth.confusion_last_hits_preview:
+        context_lines.append("AuthConfusionHitsPreview=" + json.dumps(state.auth.confusion_last_hits_preview[:4], ensure_ascii=False))
 
-    winning_ids = state.facts.get("auth_confusion_winning_ids") or []
-    if isinstance(winning_ids, list) and winning_ids:
-        context_lines.append(f"AuthConfusionWinningIds={winning_ids[:8]}")
+    if state.auth.confusion_winning_ids:
+        context_lines.append(f"AuthConfusionWinningIds={state.auth.confusion_winning_ids[:8]}")
 
-    bad_forms = state.facts.get("auth_confusion_bad_form_actions") or []
-    if isinstance(bad_forms, list) and bad_forms:
-        context_lines.append("AuthConfusionBadFormActions=" + json.dumps(bad_forms[:8], ensure_ascii=False))
+    if state.auth.confusion_bad_form_actions:
+        context_lines.append("AuthConfusionBadFormActions=" + json.dumps(state.auth.confusion_bad_form_actions[:8], ensure_ascii=False))
 
     context_lines.append(f"HttpRequestsUsed={state.http_requests_used}")
     context_lines.append(f"TotalTextLenSeen={state.total_text_len_seen}")
@@ -167,15 +162,14 @@ def build_planner_context(
 
     context_lines.append("AvailableMacros=['replay_auth_session','follow_authenticated_branch','probe_resource_family']")
 
-    if state.facts.get("macro_session_established"):
+    if state.auth.session_established:
         context_lines.append("MacroSessionEstablished=true")
 
-    last_macro_name = str(state.facts.get("last_macro_name") or "")
-    if last_macro_name:
-        context_lines.append(f"LastMacroName={last_macro_name}")
+    if state.macro.last_name:
+        context_lines.append(f"LastMacroName={state.macro.last_name}")
 
-    last_macro_result = state.facts.get("last_macro_result")
-    if isinstance(last_macro_result, dict) and last_macro_result:
+    last_macro_result = state.macro.last_result
+    if last_macro_result:
         context_lines.append(
             "LastMacroResult="
             + json.dumps(

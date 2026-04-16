@@ -42,7 +42,7 @@ class FollowAuthenticatedBranchMacro:
     name: str = "follow_authenticated_branch"
 
     async def run(self, *, args: Dict[str, Any], ctx: MacroExecutionContext) -> Observation:
-        base_url = str(args.get("base_url") or ctx.state.facts.get("base_url") or "")
+        base_url = str(args.get("base_url") or ctx.state.base_url or "")
         raw_paths = args.get("paths") or DEFAULT_PATHS
         if not isinstance(raw_paths, list):
             raw_paths = list(DEFAULT_PATHS)

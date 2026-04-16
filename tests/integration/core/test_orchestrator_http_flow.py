@@ -45,7 +45,7 @@ async def test_orchestrator_executes_http_plan_and_records_validated_signal(tmp_
 
     state = await orchestrator.run_episode(
         user_prompt="get the flag",
-        state=State(facts={"base_url": "http://localhost"}),
+        state=State(base_url="http://localhost"),
         max_steps=1,
     )
 

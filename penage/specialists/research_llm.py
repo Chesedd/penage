@@ -29,7 +29,7 @@ def _is_stuck(st: State, *, threshold: int) -> bool:
     used = int(st.http_requests_used or 0)
     if used < 3:
         return False
-    streak = int(st.facts.get("no_new_paths_streak") or 0)
+    streak = st.no_new_paths_streak
     return streak >= threshold
 
 
@@ -145,14 +145,14 @@ class ResearchLLMSpecialist(AsyncSpecialist):
     async def propose_async(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
         _ = config
 
-        base_url = str(state.facts.get("base_url") or "")
+        base_url = state.base_url
         if not base_url:
             return []
 
         if not _is_stuck(state, threshold=self.stuck_threshold):
             return []
 
-        curr_step = int(state.facts.get("orch_step") or 0)
+        curr_step = state.orch_step
         last_step = int(getattr(state, "research_llm_last_step", 0) or 0)
         if curr_step and last_step and (curr_step - last_step) < self.cooldown_steps:
             return []
@@ -167,9 +167,7 @@ class ResearchLLMSpecialist(AsyncSpecialist):
         last_status = state.last_http_status
 
         ctx_url = best_url or last_url
-        ctx_text = best_full_s or (
-            state.facts.get("last_http_text_full") if isinstance(state.facts.get("last_http_text_full"), str) else ""
-        )
+        ctx_text = best_full_s or (state.last_http_text_full or "")
         ctx_text_excerpt = _clip(ctx_text, 9000)
 
         known_paths = sorted(list(state.known_paths))[:140]
@@ -255,7 +253,7 @@ class ResearchLLMSpecialist(AsyncSpecialist):
         resp = await self.llm.generate(messages)
         obj = parse_json_object(resp.text) or {}
         if not isinstance(obj, dict):
-            state.facts["research_last_result"] = {
+            state.research_tracking.last_result = {
                 "ok": False,
                 "error": "invalid_json",
                 "text_excerpt": _clip(resp.text or "", 400),
@@ -286,7 +284,7 @@ class ResearchLLMSpecialist(AsyncSpecialist):
                 if isinstance(p, str) and p.strip():
                     fuzz_preview.append(p.strip()[:240])
 
-        state.facts["research_last_result"] = {
+        state.research_tracking.last_result = {
             "ok": True,
             "notes": str(notes or "")[:400],
             "hypotheses": hyp_preview,
@@ -336,12 +334,12 @@ class ResearchLLMSpecialist(AsyncSpecialist):
                     break
 
         if self.enable_sandbox_fuzz and state.tool_calls_sandbox > 0 and fuzz_list:
-            ran = int(state.facts.get("research_fuzz_runs") or 0)
+            ran = state.research_tracking.fuzz_runs
             if ran < self.max_fuzz_runs:
-                last_fuzz_step = int(state.facts.get("research_last_fuzz_step") or 0)
+                last_fuzz_step = state.research_tracking.last_fuzz_step
                 if (not last_fuzz_step) or ((curr_step - last_fuzz_step) >= self.fuzz_cooldown_steps):
                     fp2 = "paths:" + "|".join(sorted(fuzz_list))
-                    if fp2 != str(state.facts.get("research_last_fuzz_fp") or ""):
+                    if fp2 != state.research_tracking.last_fuzz_fp:
                         fuzz_action = self._build_sandbox_fuzz(base_url, fuzz_list)
                         out.append(
                             CandidateAction(

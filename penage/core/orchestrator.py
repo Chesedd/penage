@@ -105,7 +105,7 @@ class Orchestrator:
         self.tracer.record_note("episode_start", step=0)
 
         for step in range(1, max_steps + 1):
-            st.facts["orch_step"] = step
+            st.orch_step = step
 
             if max_http_requests is not None and st.http_requests_used >= max_http_requests:
                 self.tracer.record_note("budget_exhausted:http_requests", step=step)
@@ -129,7 +129,7 @@ class Orchestrator:
                 self.state_updater.store_specialist_previews(st, specialist_candidates)
                 self.tracer.record_note(f"specialists:candidates={len(specialist_candidates)}", step=step)
 
-                research_preview = st.facts.get("research_candidates_preview") or []
+                research_preview = st.research_tracking.candidates_preview
                 if research_preview:
                     self.tracer.record_note(
                         "research:proposals=" + json.dumps(research_preview[:8], ensure_ascii=False),
@@ -153,8 +153,8 @@ class Orchestrator:
                     specialist_candidates=specialist_candidates,
                     actions_per_step=actions_per_step,
                 )
-                st.facts["policy_name"] = getattr(self.policy, "name", "policy")
-                st.facts["policy_chosen_source"] = decision.chosen_source
+                st.policy_name = getattr(self.policy, "name", "policy")
+                st.policy_chosen_source = decision.chosen_source
 
                 st.policy_source_counts[decision.chosen_source] = int(st.policy_source_counts.get(decision.chosen_source) or 0) + 1
                 if st.last_policy_source == decision.chosen_source:
@@ -162,10 +162,6 @@ class Orchestrator:
                 else:
                     st.same_policy_source_streak = 1
                 st.last_policy_source = decision.chosen_source
-
-                st.facts["policy_source_counts"] = dict(sorted(st.policy_source_counts.items()))
-                st.facts["last_policy_source"] = st.last_policy_source
-                st.facts["same_policy_source_streak"] = st.same_policy_source_streak
 
                 self.tracer.record_note(f"policy:{decision.chosen_source}:{decision.reason}", step=step)
 
@@ -218,13 +214,6 @@ class Orchestrator:
                 if obs.elapsed_ms is not None:
                     st.tool_elapsed_ms_total += int(obs.elapsed_ms)
 
-                st.facts["usage"] = {
-                    "llm_calls": st.llm_calls,
-                    "tool_calls_total": st.tool_calls_total,
-                    "tool_calls_http": st.tool_calls_http,
-                    "tool_calls_sandbox": st.tool_calls_sandbox,
-                    "tool_elapsed_ms_total": st.tool_elapsed_ms_total,
-                }
                 self.tracer.record_note(
                     f"usage:llm={st.llm_calls} tools={st.tool_calls_total} http={st.tool_calls_http} sb={st.tool_calls_sandbox} ms={st.tool_elapsed_ms_total}",
                     step=step,

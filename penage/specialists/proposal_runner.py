@@ -51,5 +51,5 @@ class SpecialistProposalRunner:
             trimmed = self._trim(props or [], cfg=cfg)
             out.extend(trimmed)
             source_counts[str(sp.name)] = len(trimmed)
-        state.facts["specialist_source_counts_preview"] = dict(sorted(source_counts.items(), key=lambda kv: kv[0])[:20])
+        state.specialist.source_counts_preview = dict(sorted(source_counts.items(), key=lambda kv: kv[0])[:20])
         return out

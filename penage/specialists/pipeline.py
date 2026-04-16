@@ -40,14 +40,11 @@ class CandidatePool:
 
 
 def record_specialist_error(state: State, *, specialist_name: str, error: Exception) -> None:
-    errs = state.facts.get("specialist_errors_preview")
-    if not isinstance(errs, list):
-        errs = []
-    errs.append(
+    state.specialist.errors_preview.append(
         {
             "specialist": specialist_name,
             "error_type": type(error).__name__,
             "error": str(error)[:240],
         }
     )
-    state.facts["specialist_errors_preview"] = errs[-10:]
+    state.specialist.errors_preview = state.specialist.errors_preview[-10:]

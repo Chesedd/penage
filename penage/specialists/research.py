@@ -61,17 +61,12 @@ def _best_context_text(st: State) -> str:
     last = getattr(st, "last_http_text_full", None)
     if isinstance(last, str) and last:
         return last
-    fact_last = st.facts.get("last_http_text_full")
-    if isinstance(fact_last, str):
-        return fact_last
     return ""
 
 
 def _best_id_candidates(st: State) -> List[str]:
     ids = list(getattr(st, "best_http_ids", []) or [])
-    page_ids = st.facts.get("page_ids") or []
-    if isinstance(page_ids, list):
-        ids.extend(str(x) for x in page_ids if isinstance(x, str))
+    ids.extend(st.page_ids)
 
     seen = set()
     out: List[str] = []
@@ -90,10 +85,7 @@ def _is_stuck(st: State, *, threshold: int) -> bool:
     if used < 2:
         return False
 
-    streak = int(getattr(st, "no_new_paths_streak", 0) or 0)
-    if streak <= 0:
-        streak = int(st.facts.get("no_new_paths_streak") or 0)
-
+    streak = st.no_new_paths_streak
     return streak >= threshold
 
 
@@ -148,8 +140,7 @@ def _recent_memory_paths(st: State) -> List[str]:
 
 
 def _pivot_active(st: State) -> bool:
-    curr_step = int(st.facts.get("orch_step") or 0)
-    return curr_step <= int(getattr(st, "promoted_pivot_active_until_step", 0) or 0)
+    return st.orch_step <= st.promoted_pivot_active_until_step
 
 
 def _pivot_targets(st: State) -> list[str]:
@@ -312,21 +303,21 @@ class ResearchSpecialist:
     def propose(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
         _ = config
 
-        base_url = str(state.facts.get("base_url") or "")
+        base_url = state.base_url
         if not base_url:
             return []
 
         if not _is_stuck(state, threshold=self.stuck_threshold):
             return []
 
-        curr_step = int(state.facts.get("orch_step") or 0)
-        last_step = int(state.facts.get("research_det_last_step") or 0)
+        curr_step = state.orch_step
+        last_step = state.research_tracking.det_last_step
         if curr_step and last_step and (curr_step - last_step) < self.cooldown_steps:
             return []
 
         candidates = _extract_contextual_candidates(state)
-        state.facts["research_det_last_step"] = curr_step
-        state.facts["research_det_preview"] = [
+        state.research_tracking.det_last_step = curr_step
+        state.research_tracking.det_preview = [
             {"path": p, "reason": why, "tags": tags, "bonus": bonus}
             for (p, why, tags, bonus) in candidates[:10]
         ]
@@ -393,8 +384,8 @@ class ResearchSpecialist:
             count += 1
 
         if self.enable_sandbox_fuzz and state.tool_calls_sandbox > 0:
-            ran = int(state.facts.get("research_fuzz_runs") or 0)
-            last_fuzz_step = int(state.facts.get("research_last_fuzz_step") or 0)
+            ran = state.research_tracking.fuzz_runs
+            last_fuzz_step = state.research_tracking.last_fuzz_step
             if ran < self.max_fuzz_runs and ((not last_fuzz_step) or ((curr_step - last_fuzz_step) >= self.fuzz_cooldown_steps)):
                 fuzz_words = None
                 if _pivot_active(state):
@@ -403,7 +394,7 @@ class ResearchSpecialist:
                 if fuzz_action is not None:
                     cmd = str((fuzz_action.params or {}).get("command") or "")
                     fp2 = str(hash(cmd))
-                    if fp2 != str(state.facts.get("research_last_fuzz_fp") or ""):
+                    if fp2 != state.research_tracking.last_fuzz_fp:
                         actions.append(
                             CandidateAction(
                                 action=fuzz_action,

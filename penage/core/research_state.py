@@ -14,7 +14,7 @@ from penage.core.state_helpers import (
 @dataclass(slots=True)
 class ResearchStateSyncer:
     def store_specialist_previews(self, st: State, specialist_candidates: list) -> None:
-        st.facts["specialist_candidates_count"] = len(specialist_candidates)
+        st.specialist.candidates_count = len(specialist_candidates)
 
         preview = []
         research_preview = []
@@ -38,13 +38,13 @@ class ResearchStateSyncer:
                     }
                 )
 
-        st.facts["specialist_candidates_preview"] = preview
+        st.specialist.candidates_preview = preview
         if research_preview:
-            st.facts["research_candidates_preview"] = research_preview[:12]
+            st.research_tracking.candidates_preview = research_preview[:12]
 
     def sync_research_memory_from_facts(self, st: State) -> None:
-        rr = st.facts.get("research_last_result")
-        if not isinstance(rr, dict):
+        rr = st.research_tracking.last_result
+        if not rr:
             return
 
         st.research_summary = str(rr.get("notes") or "")[:800]
@@ -91,7 +91,6 @@ class ResearchStateSyncer:
         st.recent_http_memory.append(item)
         if len(st.recent_http_memory) > st.recent_http_memory_limit:
             st.recent_http_memory = st.recent_http_memory[-st.recent_http_memory_limit :]
-        st.facts["recent_http_memory_preview"] = st.recent_http_memory[-st.recent_http_memory_limit :]
 
     def record_negative_http_result(
         self,
@@ -132,9 +131,6 @@ class ResearchStateSyncer:
         if len(st.recent_failures) > st.recent_failures_limit:
             st.recent_failures = st.recent_failures[-st.recent_failures_limit :]
 
-        st.facts["research_negatives_preview"] = st.research_negatives[-20:]
-        st.facts["research_negative_families_preview"] = st.research_negative_families[-12:]
-        st.facts["recent_failures_preview"] = st.recent_failures[-st.recent_failures_limit :]
 
     def promote_confirmed_pivot(
         self,
@@ -146,8 +142,6 @@ class ResearchStateSyncer:
         reason: str,
         ttl_steps: int = 6,
     ) -> None:
-        curr_step = int(st.facts.get("orch_step") or 0)
-
         merged_ids = dedup_keep_order((ids or []) + list(st.promoted_pivot_ids or []), limit=8)
         merged_targets = dedup_keep_order((targets or []) + list(st.promoted_pivot_targets or []), limit=8)
 
@@ -155,10 +149,4 @@ class ResearchStateSyncer:
         st.promoted_pivot_targets = merged_targets
         st.promoted_pivot_source = str(source or "")
         st.promoted_pivot_reason = str(reason or "")
-        st.promoted_pivot_active_until_step = curr_step + max(1, int(ttl_steps))
-
-        st.facts["promoted_pivot_ids"] = merged_ids
-        st.facts["promoted_pivot_targets"] = merged_targets
-        st.facts["promoted_pivot_source"] = st.promoted_pivot_source
-        st.facts["promoted_pivot_reason"] = st.promoted_pivot_reason
-        st.facts["promoted_pivot_active_until_step"] = st.promoted_pivot_active_until_step
+        st.promoted_pivot_active_until_step = st.orch_step + max(1, int(ttl_steps))

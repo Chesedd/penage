@@ -152,21 +152,17 @@ def path_matches_any_target(path: str, targets: list[str]) -> bool:
 
 
 def pivot_active(state: State) -> bool:
-    curr_step = int(state.facts.get("orch_step") or 0)
-    return curr_step <= int(getattr(state, "promoted_pivot_active_until_step", 0) or 0)
+    return state.orch_step <= state.promoted_pivot_active_until_step
 
 
 def macro_commitment_active(state: State) -> bool:
-    if bool(state.facts.get("macro_session_established")):
+    if state.auth.session_established:
         return True
-    if isinstance(state.facts.get("macro_followup_hits_preview"), list) and state.facts.get("macro_followup_hits_preview"):
+    if state.macro.followup_hits_preview:
         return True
-    if isinstance(state.facts.get("macro_family_hits_preview"), list) and state.facts.get("macro_family_hits_preview"):
+    if state.macro.family_hits_preview:
         return True
-    if pivot_active(state) and (
-        list(getattr(state, "promoted_pivot_targets", []) or [])
-        or list(getattr(state, "promoted_pivot_ids", []) or [])
-    ):
+    if pivot_active(state) and (state.promoted_pivot_targets or state.promoted_pivot_ids):
         return True
     return False
 

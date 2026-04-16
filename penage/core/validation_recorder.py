@@ -37,10 +37,6 @@ class ValidationRecorder:
             st.validation_validated_count += 1
 
         st.last_validation = item
-        st.facts["validation_results_preview"] = st.validation_results[-min(len(st.validation_results), 6) :]
-        st.facts["validation_evidence_count"] = st.validation_evidence_count
-        st.facts["validation_validated_count"] = st.validation_validated_count
-        st.facts["last_validation"] = item
 
         self.tracer.record_validation(item, step=step)
 

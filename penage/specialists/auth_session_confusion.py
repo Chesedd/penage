@@ -132,10 +132,6 @@ def _best_context_text(st: State) -> str:
     if isinstance(last, str) and last:
         return last
 
-    fact_last = st.facts.get("last_http_text_full")
-    if isinstance(fact_last, str):
-        return fact_last
-
     return ""
 
 
@@ -258,10 +254,8 @@ def _extract_id_candidates(st: State, forms: list[dict[str, object]]) -> list[st
             if _is_identity_name(name):
                 push(value)
 
-    page_ids = st.facts.get("page_ids") or []
-    if isinstance(page_ids, list):
-        for x in page_ids[:20]:
-            push(str(x))
+    for x in st.page_ids[:20]:
+        push(str(x))
 
     for x in list(getattr(st, "best_http_ids", []) or [])[:20]:
         push(str(x))
@@ -559,10 +553,7 @@ def _has_auth_signal(st: State, form_specs: list[dict[str, object]], id_candidat
 
 
 def _recent_auth_hits(st: State) -> list[dict[str, object]]:
-    hits = st.facts.get("auth_confusion_last_hits_preview") or []
-    if not isinstance(hits, list):
-        return []
-    return [h for h in hits if isinstance(h, dict)]
+    return [h for h in st.auth.confusion_last_hits_preview if isinstance(h, dict)]
 
 
 def _best_recent_auth_hit(st: State) -> dict[str, object] | None:
@@ -594,7 +585,7 @@ class AuthSessionConfusionSpecialist:
     def propose(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
         _ = config
 
-        base_url = str(state.facts.get("base_url") or "")
+        base_url = state.base_url
         if not base_url:
             return []
 
@@ -607,20 +598,18 @@ class AuthSessionConfusionSpecialist:
         if followup is not None:
             out.append(followup)
 
-        ran = int(state.facts.get("auth_confusion_runs") or 0)
-        if ran >= self.max_runs:
+        if state.auth.confusion_runs >= self.max_runs:
             return out
 
-        curr_step = int(state.facts.get("orch_step") or 0)
-        last_step = int(state.facts.get("auth_confusion_last_step") or 0)
+        curr_step = state.orch_step
+        last_step = state.auth.confusion_last_step
         if curr_step and last_step and (curr_step - last_step) < self.cooldown_steps:
             return out
 
         all_forms = _collect_forms(state)
         form_specs = _collect_auth_form_specs(state)
 
-        bad_form_actions = {str(x) for x in (state.facts.get("auth_confusion_bad_form_actions") or []) if
-                            isinstance(x, str)}
+        bad_form_actions = {str(x) for x in state.auth.confusion_bad_form_actions}
         if bad_form_actions:
             form_specs = [s for s in form_specs if str(s.get("action") or "") not in bad_form_actions]
         identity_inputs = _extract_identity_inputs(all_forms)
@@ -653,7 +642,7 @@ class AuthSessionConfusionSpecialist:
             + "||"
             + "|".join(str(s.get("action") or "") for s in form_specs)
         )
-        if fp == str(state.facts.get("auth_confusion_last_fp") or ""):
+        if fp == state.auth.confusion_last_fp:
             return out
 
         cmd = self._build_probe_shell_command(
@@ -666,7 +655,7 @@ class AuthSessionConfusionSpecialist:
             passwords=passwords,
         )
 
-        state.facts["auth_confusion_last_fp"] = fp
+        state.auth.confusion_last_fp = fp
 
         out.append(
             CandidateAction(
@@ -693,8 +682,8 @@ class AuthSessionConfusionSpecialist:
         if hit is None:
             return None
 
-        curr_step = int(state.facts.get("orch_step") or 0)
-        hit_step = int(state.facts.get("auth_confusion_last_step") or 0)
+        curr_step = state.orch_step
+        hit_step = state.auth.confusion_last_step
         if hit_step and curr_step and (curr_step - hit_step) > 8:
             return None
 
@@ -710,7 +699,7 @@ class AuthSessionConfusionSpecialist:
             sort_keys=True,
             ensure_ascii=False,
         )
-        if fp == str(state.facts.get("auth_confusion_followup_last_fp") or ""):
+        if fp == state.auth.confusion_followup_last_fp:
             return None
 
         improved = hit.get("improved_targets") or []
@@ -740,7 +729,7 @@ class AuthSessionConfusionSpecialist:
             target_paths=target_paths[:3],
         )
 
-        state.facts["auth_confusion_followup_last_fp"] = fp
+        state.auth.confusion_followup_last_fp = fp
 
         return CandidateAction(
             action=Action(
