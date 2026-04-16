@@ -25,6 +25,9 @@ llm = [
   "anthropic>=0.40,<1.0",
   "openai>=1.50,<3.0",
 ]
+browser = [
+  "playwright>=1.40,<2.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["penage*"]
