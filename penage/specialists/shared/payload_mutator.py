@@ -146,6 +146,106 @@ class PayloadMutator:
             survivors.append(entry)
         return survivors
 
+    async def mutate_by_category(
+        self,
+        category: str,
+        filter_model: FilterModel,
+        *,
+        backend: str | None = None,
+        max_candidates: int = 5,
+    ) -> list[str]:
+        """Variant of :meth:`mutate` keyed by a free-form category string.
+
+        Intended for non-XSS specialists (SQLi, SSTI, …). Filters library
+        entries by ``entry.context == category`` and (optionally) by
+        ``prerequisites.backend``. LLM failures degrade to deterministic
+        candidates only, preserving the same never-crashes contract.
+        """
+        if max_candidates <= 0 or not category:
+            return []
+
+        library = self._load_library()
+        survivors: list[_LibraryEntry] = []
+        for entry in library:
+            if entry.context != category:
+                continue
+            wanted_backend = entry.prerequisites.get("backend")
+            if backend is not None and wanted_backend and str(wanted_backend).lower() != backend.lower():
+                continue
+            survivors.append(entry)
+
+        deterministic = [e.template for e in survivors if e.template]
+
+        try:
+            llm_candidates = await self._generate_category_mutations(
+                category=category,
+                backend=backend,
+                filter_model=filter_model,
+                seeds=deterministic,
+                max_candidates=max_candidates,
+            )
+        except Exception as exc:  # LEGACY: LLM failures never bubble up
+            logger.warning(
+                "payload mutator LLM call (category=%s) failed: %s; using deterministic only",
+                category,
+                exc,
+            )
+            llm_candidates = []
+
+        combined: list[str] = []
+        seen: set[str] = set()
+        for payload in list(deterministic) + list(llm_candidates):
+            p = (payload or "").strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            combined.append(p)
+            if len(combined) >= max_candidates:
+                break
+        return combined
+
+    async def _generate_category_mutations(
+        self,
+        *,
+        category: str,
+        backend: str | None,
+        filter_model: FilterModel,
+        seeds: list[str],
+        max_candidates: int,
+    ) -> list[str]:
+        system = (
+            "You mutate injection payloads for authorized security testing. "
+            "Return a JSON array of strings only. No prose, no markdown fences."
+        )
+        user = json.dumps(
+            {
+                "category": category,
+                "backend": backend,
+                "filter_model": {
+                    "allowed_tags": list(filter_model.allowed_tags),
+                    "blocked_tags": list(filter_model.blocked_tags),
+                    "transformed_chars": dict(filter_model.transformed_chars),
+                },
+                "seed_payloads": seeds[:6],
+                "max_candidates": max_candidates,
+                "instruction": (
+                    "Return up to max_candidates distinct payload strings as a JSON array. "
+                    "Stay within the category and (when given) backend. No commentary."
+                ),
+            }
+        )
+        response = await self._llm.generate(
+            [
+                LLMMessage(role="system", content=system),
+                LLMMessage(role="user", content=user),
+            ],
+            temperature=0.3,
+        )
+        text = (response.text or "").strip()
+        if not text:
+            return []
+        return _parse_json_string_list(text)[:max_candidates]
+
     async def _generate_llm_mutations(
         self,
         *,
