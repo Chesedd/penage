@@ -146,6 +146,38 @@ class PayloadMutator:
             survivors.append(entry)
         return survivors
 
+    def library_entries(
+        self,
+        category: str,
+        *,
+        backend: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return library entries matching ``category`` (and optional backend).
+
+        Each entry is a plain dict with keys ``id`` / ``context`` /
+        ``prerequisites`` / ``template`` / ``description``. Intended for
+        specialists that need the structured metadata (e.g. expected output
+        markers) rather than just the payload string.
+        """
+        library = self._load_library()
+        out: list[dict[str, Any]] = []
+        for entry in library:
+            if entry.context != category:
+                continue
+            wanted_backend = entry.prerequisites.get("backend")
+            if backend is not None and wanted_backend and str(wanted_backend).lower() != backend.lower():
+                continue
+            out.append(
+                {
+                    "id": entry.id,
+                    "context": entry.context,
+                    "prerequisites": dict(entry.prerequisites),
+                    "template": entry.template,
+                    "description": entry.description,
+                }
+            )
+        return out
+
     async def mutate_by_category(
         self,
         category: str,

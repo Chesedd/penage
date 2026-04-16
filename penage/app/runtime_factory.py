@@ -29,6 +29,7 @@ from penage.specialists.research import ResearchSpecialist
 from penage.specialists.research_llm import ResearchLLMSpecialist
 from penage.specialists.sandbox_smoke import SandboxSmokeSpecialist
 from penage.specialists.vulns.sqli import SqliSpecialist
+from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
 from penage.tools.runner import ToolRunner
 from penage.validation.browser import BrowserVerifier
@@ -152,6 +153,12 @@ def build_specialists(
         memory=memory,
         tracer=tracer,
     )
+    ssti = SstiSpecialist(
+        http_tool=http_backend,
+        llm_client=llm,
+        memory=memory,
+        tracer=tracer,
+    )
 
     return SpecialistManager(
         specialists=[
@@ -164,6 +171,7 @@ def build_specialists(
             ResearchLLMSpecialist(llm),
             xss,
             sqli,
+            ssti,
         ],
         llm=llm,
         memory=memory,

