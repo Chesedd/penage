@@ -36,8 +36,9 @@ from penage.specialists.vulns.sqli import SqliSpecialist
 from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
 from penage.specialists.vulns.xxe import XxeSpecialist
+from penage.core.validation_recorder import ValidationRecorder
 from penage.tools.runner import ToolRunner
-from penage.validation.browser import BrowserEvidenceValidator, BrowserVerifier
+from penage.validation.browser import BrowserEvidenceValidator
 from penage.validation.gate import ValidationGate
 from penage.validation.http import HttpEvidenceValidator
 
@@ -162,6 +163,7 @@ def build_specialists(
     tools: ToolRunner | None = None,
     tracer: JsonlTracer | None = None,
     sandbox_agents: dict[str, SandboxAgent] | None = None,
+    browser_validator: BrowserEvidenceValidator | None = None,
 ) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
@@ -171,11 +173,16 @@ def build_specialists(
     if sandbox_agents is None:
         sandbox_agents = build_sandbox_agents(llm)
 
+    xss_validation_recorder = (
+        ValidationRecorder(tracer=tracer, validator=None) if tracer is not None else None
+    )
+
     xss = XssSpecialist(
         http_tool=http_backend,
         llm_client=sandbox_agents["xss"].llm_client,
         memory=memory,
-        browser_verifier=BrowserVerifier(),
+        browser_validator=browser_validator,
+        validation_recorder=xss_validation_recorder,
         tracer=tracer,
     )
     sqli = SqliSpecialist(
@@ -310,6 +317,7 @@ def build_orchestrator(
             cfg, llm,
             memory=memory, tools=tools, tracer=tracer,
             sandbox_agents=sandbox_agents,
+            browser_validator=browser_validator,
         ),
         macro_executor=build_macro_executor(),
         memory=memory,

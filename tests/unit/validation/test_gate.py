@@ -312,7 +312,7 @@ async def test_gate_browser_skipped_when_action_not_marked() -> None:
     stub = StubHttpValidator(result=http_result)
     browser = FakeBrowser(
         dom_responses={_BROWSER_URL: _BROWSER_PAYLOAD},
-        js_responses={DEFAULT_PROBE_EXPR: "__penage_xss_marker__"},
+        js_responses={DEFAULT_PROBE_EXPR: '[{"type":"alert","message":"xss"}]'},
     )
     validator = BrowserEvidenceValidator(browser)
     agent_llm = FakeLLMClient(
@@ -380,7 +380,7 @@ async def test_gate_browser_validates_short_circuits_agent() -> None:
     stub = StubHttpValidator(result=http_result)
     validator = _browser_validator(
         dom_for_url=_BROWSER_PAYLOAD,
-        js_marker="__penage_xss_marker__",
+        js_marker='[{"type":"alert","message":"xss"}]',
     )
     agent_llm = FakeLLMClient(fixed_text='{"verdict": "fail", "reason": "unreachable"}')
     agent = ValidationAgent.build(llm=agent_llm)
@@ -508,7 +508,7 @@ async def test_gate_http_none_browser_validates() -> None:
     stub = StubHttpValidator(result=None)
     validator = _browser_validator(
         dom_for_url=_BROWSER_PAYLOAD,
-        js_marker="__penage_xss_marker__",
+        js_marker='[{"type":"alert","message":"xss"}]',
     )
     agent_llm = FakeLLMClient(fixed_text='{"verdict": "fail", "reason": "unreachable"}')
     agent = ValidationAgent.build(llm=agent_llm)
