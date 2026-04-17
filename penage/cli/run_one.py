@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 
-from penage.app.bootstrap import build_runtime
+from penage.app.bootstrap import build_runtime, seed_role_sessions_from_config
 from penage.app.config import runtime_config_from_args
 from penage.app.summary import build_episode_summary
 from penage.core.guard import RunMode
@@ -70,6 +70,35 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--experiment-tag", default="", help="Optional experiment tag for A/B runs")
 
+    p.add_argument(
+        "--idor-role-a-user",
+        default="",
+        help="Role A username for IDOR differential tests. "
+             "Overrides env PENAGE_IDOR_ROLE_A_USER.",
+    )
+    p.add_argument(
+        "--idor-role-a-pass",
+        default="",
+        help="Role A password. Overrides env PENAGE_IDOR_ROLE_A_PASS.",
+    )
+    p.add_argument(
+        "--idor-role-b-user",
+        default="",
+        help="Role B username. Overrides env PENAGE_IDOR_ROLE_B_USER.",
+    )
+    p.add_argument(
+        "--idor-role-b-pass",
+        default="",
+        help="Role B password. Overrides env PENAGE_IDOR_ROLE_B_PASS.",
+    )
+    p.add_argument(
+        "--idor-login-url",
+        default="",
+        help="Optional explicit login URL for role authentication. "
+             "If empty, IdorSpecialist attempts to auto-discover from "
+             "state.forms_by_url. Overrides env PENAGE_IDOR_LOGIN_URL.",
+    )
+
     return p.parse_args()
 
 
@@ -87,9 +116,12 @@ async def main_async() -> int:
             max_wall_clock_s=cfg.early_stop_seconds,
         )
 
+        st = State(base_url=bundle.base_url)
+        seed_role_sessions_from_config(st, cfg)
+
         st, tracker = await bundle.orchestrator.run_episode(
             user_prompt=build_user_prompt(bundle.base_url),
-            state=State(base_url=bundle.base_url),
+            state=st,
             max_steps=cfg.max_steps,
             actions_per_step=cfg.actions_per_step,
             max_http_requests=cfg.max_http_requests,

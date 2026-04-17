@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,26 @@ class RuntimeConfig:
     # Memory store
     memory_db_path: str = "runs/memory.sqlite"
 
+    # IDOR multi-role credentials. Empty string means "role not configured"
+    # and IdorSpecialist's phase 2/3 will be skipped with a note.
+    idor_role_a_user: str = ""
+    idor_role_a_pass: str = ""
+    idor_role_b_user: str = ""
+    idor_role_b_pass: str = ""
+    idor_login_url: str = ""
+
+
+def _idor_cred_from_args_or_env(
+    args: Namespace,
+    *,
+    arg_name: str,
+    env_name: str,
+) -> str:
+    val = str(getattr(args, arg_name, "") or "")
+    if val:
+        return val
+    return os.environ.get(env_name, "")
+
 
 def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
     summary_path = Path(args.summary_json) if getattr(args, "summary_json", "") else None
@@ -61,6 +82,22 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
     # Backward-compat: if provider is ollama and llm_model is empty, fall back to --ollama-model
     if provider == "ollama" and not llm_model:
         llm_model = ollama_model
+
+    idor_role_a_user = _idor_cred_from_args_or_env(
+        args, arg_name="idor_role_a_user", env_name="PENAGE_IDOR_ROLE_A_USER"
+    )
+    idor_role_a_pass = _idor_cred_from_args_or_env(
+        args, arg_name="idor_role_a_pass", env_name="PENAGE_IDOR_ROLE_A_PASS"
+    )
+    idor_role_b_user = _idor_cred_from_args_or_env(
+        args, arg_name="idor_role_b_user", env_name="PENAGE_IDOR_ROLE_B_USER"
+    )
+    idor_role_b_pass = _idor_cred_from_args_or_env(
+        args, arg_name="idor_role_b_pass", env_name="PENAGE_IDOR_ROLE_B_PASS"
+    )
+    idor_login_url = _idor_cred_from_args_or_env(
+        args, arg_name="idor_login_url", env_name="PENAGE_IDOR_LOGIN_URL"
+    )
 
     return RuntimeConfig(
         base_url=str(args.base_url),
@@ -87,4 +124,9 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         memory_db_path=str(getattr(args, "memory_db", "runs/memory.sqlite") or "runs/memory.sqlite"),
         experiment_tag=str(getattr(args, "experiment_tag", "") or ""),
         allowed_hosts=tuple(str(x) for x in getattr(args, "allowed_host", []) or []),
+        idor_role_a_user=idor_role_a_user,
+        idor_role_a_pass=idor_role_a_pass,
+        idor_role_b_user=idor_role_b_user,
+        idor_role_b_pass=idor_role_b_pass,
+        idor_login_url=idor_login_url,
     )
