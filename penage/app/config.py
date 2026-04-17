@@ -57,6 +57,11 @@ class RuntimeConfig:
     idor_role_b_pass: str = ""
     idor_login_url: str = ""
 
+    # MAPTA-style multi-agent (Stage 3) — consumers wired in 3.3/3.7/3.8/3.9.
+    sandbox_concurrency: int = 2
+    correlation_stop_enabled: bool = True
+    validation_mode: str = "http"
+
 
 def _idor_cred_from_args_or_env(
     args: Namespace,
@@ -129,4 +134,7 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         idor_role_b_user=idor_role_b_user,
         idor_role_b_pass=idor_role_b_pass,
         idor_login_url=idor_login_url,
+        sandbox_concurrency=int(args.sandbox_concurrency),
+        correlation_stop_enabled=not bool(args.no_correlation_stop),
+        validation_mode=str(args.validation_mode),
     )

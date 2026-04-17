@@ -99,6 +99,26 @@ def parse_args() -> argparse.Namespace:
              "state.forms_by_url. Overrides env PENAGE_IDOR_LOGIN_URL.",
     )
 
+    p.add_argument(
+        "--sandbox-concurrency",
+        type=int,
+        default=2,
+        help="Max parallel sandbox agents (Stage 3.7).",
+    )
+    p.add_argument(
+        "--no-correlation-stop",
+        action="store_true",
+        default=False,
+        help="Disable correlation-based early stopping (Stage 3.8).",
+    )
+    p.add_argument(
+        "--validation-mode",
+        choices=["http", "agent"],
+        default="http",
+        help="Validation gate mode: http = fast HTTP/Browser only (back-compat); "
+             "agent = add ValidationAgent LLM confirmation (Stage 3.3).",
+    )
+
     return p.parse_args()
 
 

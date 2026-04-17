@@ -59,6 +59,9 @@ def make_args(**overrides: object) -> Namespace:
         idor_role_b_user="",
         idor_role_b_pass="",
         idor_login_url="",
+        sandbox_concurrency=2,
+        no_correlation_stop=False,
+        validation_mode="http",
     )
     defaults.update(overrides)
     return Namespace(**defaults)
