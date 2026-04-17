@@ -76,6 +76,20 @@ _SKIP_INPUT_TYPES = frozenset(
     }
 )
 
+_ADMIN_PATH_HINTS = (
+    "/admin",
+    "/administration",
+    "/dashboard/admin",
+    "/settings/admin",
+    "/admin/users",
+    "/admin/settings",
+    "/console",
+    "/manage",
+    "/management",
+    "/backoffice",
+    "/internal",
+)
+
 
 @dataclass(slots=True)
 class _IdorTarget:
@@ -131,20 +145,34 @@ class _BudgetedHttpTool:
 
 @dataclass(slots=True)
 class IdorSpecialist(AsyncSpecialist):
-    """AWE-style IDOR specialist (phases 0-5).
+    """AWE-style IDOR specialist (phases 0-5, all implemented).
 
-    Phase 0 — login role A and role B via shared/session_login. (IDOR-3)
-    Phase 1 — target discovery (THIS SESSION). Scans state for endpoints
-              that carry ID-like parameters in query, path, or form.
-    Phase 2 — horizontal differential (role A vs role B on same resource).
-              (IDOR-3)
-    Phase 3 — sequential enumeration (role A tries id+/-1..+/-5). (IDOR-4)
-    Phase 4 — vertical (unauthenticated vs role B on admin-like paths).
-              (IDOR-4)
-    Phase 5 — candidate finalization.                           (IDOR-4)
+    Phase 0 — login role A and role B via shared/session_login.
+    Phase 1 — target discovery. Scans state for endpoints carrying
+              ID-like parameters in query, path, or form.
+    Phase 2 — horizontal differential (role A vs role B on same
+              resource). Verified iff compare_responses returns
+              LEAK_IDENTICAL_BODY or LEAK_SHARED_MARKERS.
+    Phase 3 — sequential enumeration (role A tries id+/-1..+/-N on
+              numeric targets). Verified on identical-to-baseline
+              body or cross-owner markers.
+    Phase 4 — vertical privilege probe (unauthenticated vs role B on
+              admin-like paths). Runs ONCE per episode (not per
+              target) and only if no prior phase produced a verified
+              finding.
+    Phase 5 — candidate finalization per target. Assembles an
+              unverified candidate (status-differential from phase 2
+              or enumeration status-spread from phase 3) when no
+              phase produced a verified finding for that target.
 
-    Verified iff compare_responses returns LEAK_IDENTICAL_BODY or
-    LEAK_SHARED_MARKERS. STATUS_DIFFERENTIAL -> candidate only.
+    STATUS_DIFFERENTIAL and enumeration status-spread yield
+    unverified candidates (CLAUDE.md invariant #4: validation gate).
+
+    Vertical IDOR is a weak class of signals: without admin-role
+    ground-truth credentials we detect it as "regular user (role B)
+    can access an admin-like path that unauthenticated requests
+    cannot". Not proof of an admin-only leak; manual confirmation
+    advised.
 
     DESIGN NOTE: like XXE, IDOR is purely deterministic. LLM-based
     enumeration of ID values is low-ROI; we rely on sequential and
@@ -172,6 +200,7 @@ class IdorSpecialist(AsyncSpecialist):
     max_targets: int = 4
     min_reserve_http: int = 8
     max_enumeration_probes: int = 5
+    max_vertical_paths: int = 3
 
     _done: bool = field(default=False, init=False)
     _attempted: set[str] = field(default_factory=set, init=False)
@@ -203,7 +232,9 @@ class IdorSpecialist(AsyncSpecialist):
         login_outcome = await self._run_login_phase(
             state=state, http_tool=budgeted, step=step,
         )
-        both_roles_ready = bool(login_outcome.get("A") and login_outcome.get("B"))
+        role_a_ready = bool(login_outcome.get("A", False))
+        role_b_ready = bool(login_outcome.get("B", False))
+        both_roles_ready = role_a_ready and role_b_ready
 
         for target in targets[: self.max_targets]:
             key = self._target_key(target)
@@ -215,6 +246,7 @@ class IdorSpecialist(AsyncSpecialist):
 
             self._trace_phase(1, "target_discovery", step=step, target=target)
 
+            # Phase 2: horizontal (requires both roles).
             if both_roles_ready:
                 self._trace_phase(
                     2, "horizontal_differential", step=step, target=target,
@@ -230,15 +262,12 @@ class IdorSpecialist(AsyncSpecialist):
             else:
                 self._note(
                     f"idor:horizontal_skipped_no_roles "
-                    f"a={bool(login_outcome.get('A'))} "
-                    f"b={bool(login_outcome.get('B'))}"
+                    f"a={role_a_ready} b={role_b_ready}"
                 )
 
-            # Phase 3: sequential enumeration (role A only, numeric targets).
-            role_a = state.auth_roles.get("A")
+            # Phase 3: sequential enumeration (role A, numeric only).
             if (
-                role_a is not None
-                and role_a.established
+                role_a_ready
                 and target.is_numeric
                 and budgeted.remaining >= self.min_reserve_http
             ):
@@ -254,40 +283,89 @@ class IdorSpecialist(AsyncSpecialist):
                     self._attempted.add(key)
                     break
 
+            # Phase 5: candidate from partial signals on this target.
+            self._trace_phase(
+                5, "candidate_finalization", step=step, target=target,
+            )
+            candidate = self._finalize_candidate(
+                target=target,
+                observations=self._observations.get(key, []),
+            )
+            if candidate is not None:
+                self._findings.append(candidate)
+
             self._attempted.add(key)
+
+        # Phase 4: vertical (once per episode, only if nothing verified yet).
+        if (
+            not self._done
+            and role_b_ready
+            and budgeted.remaining >= 6
+        ):
+            self._trace_phase(
+                4, "vertical_privilege_probe", step=step, target=None,
+            )
+            vert_finding = await self._run_vertical_phase(
+                state=state, http_tool=budgeted, step=step,
+            )
+            if vert_finding and vert_finding.get("verified"):
+                self._findings.append(vert_finding)
+                self._done = True
 
         return self._emit_if_any()
 
     def _emit_if_any(self) -> List[CandidateAction]:
-        verified = [f for f in self._findings if f.get("verified")]
-        if not verified:
+        """Emit a single CandidateAction — verified preferred over candidate.
+
+        CLAUDE.md invariant #4: candidate findings must not masquerade as
+        verified. If any verified finding is present, it is emitted
+        (score >= 9.0). Otherwise, the last candidate is emitted with
+        score < 5.0 and tag "unverified".
+        """
+        if not self._findings:
             return []
-        finding = verified[-1]
-        mode = finding.get("mode", "unknown")
-        kind = finding.get("kind", "unknown")
+        verified = [f for f in self._findings if f.get("verified")]
+        chosen = verified[-1] if verified else self._findings[-1]
+
+        is_verified = bool(chosen.get("verified"))
+        mode = chosen.get("mode", "unknown")
+        kind = chosen.get("kind", "") or "unknown"
+        tag = "verified" if is_verified else "unverified"
         action = Action(
             type=ActionType.NOTE,
-            params={"kind": "idor_finding", "finding": finding},
-            tags=["idor", "verified", mode, kind],
+            params={"kind": "idor_finding", "finding": chosen},
+            tags=["idor", tag, mode, kind],
         )
-        if kind == "idor_horizontal_identical_body":
-            score = 12.0
-        elif kind == "idor_enum_cross_owner":
-            score = 12.0
-        elif kind == "idor_horizontal_shared_markers":
-            score = 11.0
-        elif kind == "idor_enum_identical_baseline":
-            score = 10.0
+
+        if is_verified:
+            if kind == "idor_horizontal_identical_body":
+                score = 12.0
+            elif kind == "idor_enum_cross_owner":
+                score = 12.0
+            elif kind == "idor_horizontal_shared_markers":
+                score = 11.0
+            elif kind == "idor_enum_identical_baseline":
+                score = 10.0
+            elif kind == "idor_vertical_privilege":
+                score = 9.0
+            else:
+                score = 8.0
         else:
-            score = 9.0
+            if kind == "idor_status_differential":
+                score = 3.0
+            elif kind == "idor_enum_status_spread":
+                score = 2.0
+            else:
+                score = 2.0
+
         return [
             CandidateAction(
                 action=action,
                 source=self.name,
                 score=score,
                 cost=0.0,
-                reason=finding.get("summary") or "IDOR finding",
-                metadata={"evidence": finding},
+                reason=chosen.get("summary") or "IDOR finding",
+                metadata={"evidence": chosen},
             )
         ]
 
@@ -747,13 +825,248 @@ class IdorSpecialist(AsyncSpecialist):
 
         return None
 
-    async def _run_vertical_phase(self, *args: Any, **kwargs: Any) -> Any:
-        """Phase 4 - unauth vs role B on admin paths. Implemented in IDOR-4."""
-        raise NotImplementedError("Implemented in IDOR-4")
+    def _discover_admin_paths(self, state: State) -> list[str]:
+        """Return up to max_vertical_paths URLs that look admin-scoped.
 
-    def _finalize_candidate(self, *args: Any, **kwargs: Any) -> Any:
-        """Phase 5 - candidate from status differential. Implemented in IDOR-4."""
-        raise NotImplementedError("Implemented in IDOR-4")
+        Scans state.last_http_url and state.recent_http_memory for URLs
+        whose path contains an admin hint (see _ADMIN_PATH_HINTS). Deduped
+        by scheme+netloc+path (query and fragment are stripped).
+        """
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        candidate_urls: list[str] = []
+        if getattr(state, "last_http_url", None):
+            candidate_urls.append(str(state.last_http_url))
+        for rec in (getattr(state, "recent_http_memory", None) or []):
+            if isinstance(rec, dict):
+                u = rec.get("url")
+                if u:
+                    candidate_urls.append(str(u))
+
+        for url in candidate_urls:
+            try:
+                path = (urlparse(url).path or "").lower()
+            except Exception:
+                continue
+            if not any(h in path for h in _ADMIN_PATH_HINTS):
+                continue
+            base = url.split("#", 1)[0].split("?", 1)[0]
+            if base in seen:
+                continue
+            seen.add(base)
+            urls.append(base)
+            if len(urls) >= self.max_vertical_paths:
+                break
+
+        return urls
+
+    async def _run_vertical_phase(
+        self,
+        *,
+        state: State,
+        http_tool: _BudgetedHttpTool,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 4: privilege-escalation signal — role B sees admin-like
+        pages that unauthenticated requests cannot.
+
+        Runs once per episode (NOT per target). Uses role B + an empty
+        cookie probe. Role A is intentionally not used: A may own
+        admin-scoped resources (e.g. A is the admin) and that is not an
+        IDOR. We want a regular user (B) seeing admin content that
+        anonymous cannot.
+
+        DESIGN NOTE: vertical IDOR is a weak class of signals without
+        admin-role ground-truth credentials. In penage we catch it as
+        "regular user sees admin page that unauth does not" — imperfect
+        but useful; manual confirmation advised.
+        """
+        _ = step
+        registry = state.auth_roles
+        role_b = registry.get("B")
+        if role_b is None or not role_b.established:
+            return None
+
+        admin_urls = self._discover_admin_paths(state)
+        if not admin_urls:
+            return None
+
+        if http_tool.remaining < 3:
+            return None
+
+        for admin_url in admin_urls:
+            if http_tool.remaining < 3:
+                break
+
+            unauth_params = {
+                "method": "GET",
+                "url": admin_url,
+                "cookies": {},
+                "follow_redirects": False,
+            }
+            obs_unauth = await http_tool.run(
+                Action(type=ActionType.HTTP, params=unauth_params)
+            )
+            body_unauth, status_unauth = _extract_body_status(obs_unauth)
+
+            b_params = {
+                "method": "GET",
+                "url": admin_url,
+                "cookies": dict(role_b.cookies),
+                "follow_redirects": False,
+            }
+            obs_b = await http_tool.run(
+                Action(type=ActionType.HTTP, params=b_params)
+            )
+            body_b, status_b = _extract_body_status(obs_b)
+
+            self._observations.setdefault("__vertical__", []).append({
+                "phase": "vertical",
+                "url": admin_url,
+                "unauth_status": status_unauth,
+                "b_status": status_b,
+                "unauth_body_len": len(body_unauth),
+                "b_body_len": len(body_b),
+            })
+
+            unauth_denied = (
+                status_unauth is not None
+                and status_unauth in (401, 403)
+            ) or (
+                status_unauth in (302, 303)
+                and _location_looks_like_login(obs_unauth)
+            )
+            b_ok = (
+                status_b is not None
+                and 200 <= status_b < 300
+                and len(body_b) >= 32
+            )
+
+            if unauth_denied and b_ok:
+                self._record_attempt(
+                    host=_host_of(admin_url),
+                    parameter="__vertical__",
+                    payload=admin_url,
+                    outcome="verified_vertical",
+                )
+                return {
+                    "verified": True,
+                    "kind": "idor_vertical_privilege",
+                    "mode": "vertical",
+                    "parameter": "__vertical__",
+                    "id_location": "path",
+                    "id_value": "",
+                    "channel": "GET",
+                    "url": admin_url,
+                    "evidence": {
+                        "signal": "role_b_sees_admin_path",
+                        "unauth_status": status_unauth,
+                        "b_status": status_b,
+                        "unauth_body_len": len(body_unauth),
+                        "b_body_len": len(body_b),
+                        "role_b_user": role_b.username,
+                        "note": (
+                            "Regular user (role B) accesses admin-like "
+                            "path that unauthenticated requests cannot. "
+                            "This is a privilege-escalation signal, not "
+                            "proof of an admin-only resource leak; "
+                            "manual confirmation advised."
+                        ),
+                    },
+                    "summary": (
+                        f"Vertical IDOR: role B accesses {admin_url} "
+                        f"(unauth {status_unauth}, B {status_b})"
+                    ),
+                }
+
+        return None
+
+    def _finalize_candidate(
+        self,
+        *,
+        target: _IdorTarget,
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Phase 5: assemble a candidate finding from partial signals.
+
+        Priority:
+          1. Horizontal phase recorded STATUS_DIFFERENTIAL → candidate
+             with score 3.0.
+          2. Enumeration phase non_2xx probes with >=2 distinct status
+             codes (e.g. id-10 → 404, id-11 → 403, id-12 → 500) — the
+             server distinguishes between missing, forbidden, and
+             erroring IDs, which is an information leak → score 2.0.
+          3. Otherwise None.
+
+        Candidates are unverified (verified=False) — they do NOT cross
+        the CLAUDE.md invariant #4 validation gate.
+        """
+        if not observations:
+            return None
+
+        horiz_diff = next(
+            (
+                o for o in observations
+                if o.get("phase") == "horizontal"
+                and o.get("signal") == DifferentialSignal.STATUS_DIFFERENTIAL.value
+            ),
+            None,
+        )
+        if horiz_diff is not None:
+            return {
+                "verified": False,
+                "kind": "idor_status_differential",
+                "mode": "candidate",
+                "parameter": target.id_param,
+                "id_location": target.id_location,
+                "id_value": target.id_value,
+                "channel": target.channel,
+                "url": target.url,
+                "evidence": {
+                    "signal": "horizontal_status_differential",
+                    "a_status": horiz_diff.get("a_status"),
+                    "b_status": horiz_diff.get("b_status"),
+                    "a_body_len": horiz_diff.get("a_body_len"),
+                    "b_body_len": horiz_diff.get("b_body_len"),
+                },
+                "reason": "status_or_length_differential",
+                "summary": (
+                    f"IDOR candidate: horizontal request yields "
+                    f"status/length differential on {target.id_param}"
+                ),
+            }
+
+        enum_statuses: list[int] = []
+        for o in observations:
+            if o.get("phase") != "enumeration":
+                continue
+            st = o.get("status")
+            if isinstance(st, int) and not (200 <= st < 300):
+                enum_statuses.append(st)
+        if len(set(enum_statuses)) >= 2:
+            return {
+                "verified": False,
+                "kind": "idor_enum_status_spread",
+                "mode": "candidate",
+                "parameter": target.id_param,
+                "id_location": target.id_location,
+                "id_value": target.id_value,
+                "channel": target.channel,
+                "url": target.url,
+                "evidence": {
+                    "signal": "enumeration_status_spread",
+                    "status_spread": sorted(set(enum_statuses)),
+                    "probes_count": len(enum_statuses),
+                },
+                "reason": "server_leaks_id_existence_via_status_codes",
+                "summary": (
+                    f"IDOR candidate: enumeration shows status spread "
+                    f"{sorted(set(enum_statuses))} across probes"
+                ),
+            }
+
+        return None
 
     def _discover_targets(self, state: State) -> list[_IdorTarget]:
         found: list[_IdorTarget] = []
@@ -952,6 +1265,26 @@ def _extract_body_status(obs: Observation) -> tuple[str, int | None]:
     body = str(obs.data.get("text_full") or obs.data.get("text_excerpt") or "")
     status = obs.data.get("status_code")
     return body, (int(status) if isinstance(status, int) else None)
+
+
+def _location_looks_like_login(obs: Observation) -> bool:
+    """Does the Location header of a 3xx response point to a login page?"""
+    if not obs.ok or not isinstance(obs.data, dict):
+        return False
+    headers = obs.data.get("headers") or {}
+    location = ""
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).lower() == "location":
+                location = str(v or "")
+                break
+    if not location:
+        return False
+    try:
+        path = (urlparse(location).path or location).lower()
+    except Exception:
+        path = location.lower()
+    return any(h in path for h in ("login", "signin", "sign-in", "auth"))
 
 
 def _set_query_param(url: str, name: str, value: str) -> str:
