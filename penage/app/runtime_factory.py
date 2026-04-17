@@ -32,6 +32,7 @@ from penage.specialists.vulns.lfi import LfiSpecialist
 from penage.specialists.vulns.sqli import SqliSpecialist
 from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
+from penage.specialists.vulns.xxe import XxeSpecialist
 from penage.tools.runner import ToolRunner
 from penage.validation.browser import BrowserVerifier
 
@@ -167,6 +168,15 @@ def build_specialists(
         tracer=tracer,
         oob_listener=None,
     )
+    xxe = XxeSpecialist(
+        http_tool=http_backend,
+        llm_client=llm,
+        memory=memory,
+        tracer=tracer,
+        # shared OobListener wiring is a separate infra task; until then
+        # phase 4 degrades gracefully via the is_running check.
+        oob_listener=None,
+    )
 
     return SpecialistManager(
         specialists=[
@@ -181,6 +191,7 @@ def build_specialists(
             sqli,
             ssti,
             lfi,
+            xxe,
         ],
         llm=llm,
         memory=memory,

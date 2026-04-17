@@ -106,15 +106,51 @@ class _BudgetedHttpTool:
 
 @dataclass(slots=True)
 class XxeSpecialist(AsyncSpecialist):
-    """AWE-style XXE specialist (phases 1-5).
+    """AWE-style XXE specialist.
 
-    In this iteration implemented: Phase 1 only (target discovery).
-    Phases 2-5 — NotImplementedError (added in 2.7b-ii, 2.7b-iii,
-    2.7c, 2.7d).
+    Five phases per target (URL + delivery channel):
 
-    Design note: LLM-based payload mutation intentionally omitted
-    for XXE — LLMs reliably generate invalid DTDs; this specialist
-    remains purely deterministic + OOB.
+    1. **Target discovery.** XML-accepting endpoints are flagged from
+       ``recent_http_memory`` (XML/SOAP content-types), URL-path hints
+       (``/xml``, ``/soap``, ``/wsdl``, ``/rpc``, ``/feed``), or forms
+       whose fields carry XML-shaped names (``xml``, ``soap``, ``body``,
+       ``payload``…).
+    2. **Classic SYSTEM-entity probes.** Yaml-curated payloads from
+       ``xxe.yaml`` (categories ``classic-unix`` / ``classic-windows``
+       / ``error-based`` / ``no-doctype-sanity`` / ``soap-wrapped``) are
+       fired and the body is scanned with
+       :func:`penage.specialists.shared.xml_utils.detect_xxe_markers`.
+       A strong marker family (``unix_passwd``, ``unix_hosts``,
+       ``win_ini``, ``win_hosts``, ``entity_expansion``) wins — the
+       finding is verified.
+    3. **Parameter-entity variants.** The canonical
+       ``<!ENTITY % param1 SYSTEM "…">`` shape from
+       :func:`build_parameter_entity_payload` targets parsers that
+       allow ``%`` where ``&`` is blocked. In-band only.
+    4. **OOB blind XXE.** A fresh token is registered with the shared
+       :class:`OobListener`; :func:`build_oob_blind_payload` forces
+       the parser to fetch our listener URL. A hit within the
+       timeout verifies the XXE. Phase 4 is skipped quietly when
+       the listener is missing or not running.
+    5. **Candidate finalization.** When no phase verified, phase 5
+       assembles an ``unverified`` candidate from partial signals
+       collected across phases 2-4 — either an
+       ``xxe_parser_reachable`` (parser accepted XML but blocked
+       the DTD / ENTITY; ``xml_parse_error`` marker landed) or an
+       ``xxe_status_differential`` (some payloads returned 2xx,
+       others 5xx, suggesting partial entity processing).
+
+    Every outgoing payload passes through :class:`XmlSafetyFilter`
+    so billion-laughs / quadratic-blowup DoS shapes never leave the
+    specialist. A verified finding short-circuits remaining phases
+    for that target; once any target is verified the specialist
+    goes ``_done``.
+
+    Design decision: LLM-based payload mutation is intentionally
+    omitted for XXE because LLMs reliably generate invalid DTDs;
+    the specialist relies on deterministic templates from
+    ``xxe.yaml`` and the ``build_*_payload`` helpers in
+    ``shared.xml_utils``.
     """
 
     name: ClassVar[str] = "xxe"
@@ -230,30 +266,48 @@ class XxeSpecialist(AsyncSpecialist):
                     self._attempted.add(key)
                     break
 
-            # Phase 5 — next session.
+            # Phase 5 — candidate finalization (only reached when no phase verified).
+            self._trace_phase(
+                5, "candidate_finalization", step=step, target=target,
+            )
+            candidate = self._finalize_candidate(
+                target=target,
+                channel=target.channel,
+                observations=self._observations.get(key, []),
+            )
+            if candidate is not None:
+                self._findings.append(candidate)
+
             self._attempted.add(key)
 
         return self._emit_if_any()
 
     def _emit_if_any(self) -> List[CandidateAction]:
-        verified = [f for f in self._findings if f.get("verified")]
-        if not verified:
+        if not self._findings:
             return []
-        finding = verified[-1]
+        finding = self._findings[-1]
+        verified = bool(finding.get("verified"))
+        tag = "verified" if verified else "unverified"
         action = Action(
             type=ActionType.NOTE,
             params={"kind": "xxe_finding", "finding": finding},
             tags=[
                 "xxe",
-                "verified",
+                tag,
                 finding.get("family") or finding.get("kind", "unknown"),
             ],
         )
+        if verified:
+            score = 12.0
+        elif finding.get("kind") == "xxe_parser_reachable":
+            score = 3.0
+        else:
+            score = 2.0
         return [
             CandidateAction(
                 action=action,
                 source=self.name,
-                score=12.0,
+                score=score,
                 cost=0.0,
                 reason=finding.get("summary") or "XXE finding",
                 metadata={"evidence": finding},
@@ -774,8 +828,93 @@ class XxeSpecialist(AsyncSpecialist):
 
         return None
 
-    def _finalize_candidate(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.7d")
+    def _finalize_candidate(
+        self,
+        *,
+        target: _XxeTarget,
+        channel: str,
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Phase 5: assemble an unverified candidate from partial signals.
+
+        Possible outcomes:
+
+        * ``xxe_parser_reachable`` — at least one payload triggered an
+          ``xml_parse_error`` marker. The parser accepted the XML but
+          rejected the DTD/ENTITY, so XXE is either disabled or filtered.
+          Emitted with ``score=3.0``.
+        * ``xxe_status_differential`` — at least one payload returned a
+          2xx response while another returned a 5xx. This hints that a
+          subset of the entity expansions are being processed while
+          others crash the parser. Emitted with ``score=2.0``.
+        * ``None`` — either ``observations`` is empty or every response
+          was a boring 4xx (endpoint rejects outright), in which case
+          no candidate is emitted at all.
+        """
+        if not observations:
+            return None
+
+        # Weak signal: at least one payload produced an xml_parse_error.
+        xml_err = next(
+            (o for o in observations if o.get("xml_parse_error")),
+            None,
+        )
+        if xml_err is not None:
+            return {
+                "verified": False,
+                "kind": "xxe_parser_reachable",
+                "mode": "candidate",
+                "delivery": target.delivery,
+                "parameter": target.parameter,
+                "payload_id": xml_err.get("payload_id", "unknown"),
+                "channel": channel,
+                "url": target.url,
+                "family": "xml_parse_error",
+                "evidence": {
+                    "xml_parse_error": True,
+                    "response_excerpt": xml_err.get("body_excerpt", ""),
+                    "http_status": xml_err.get("status"),
+                },
+                "reason": "parser_reachable_but_entities_blocked",
+                "summary": (
+                    f"XML parser reachable on {target.url}; "
+                    f"entity expansion blocked/disabled"
+                ),
+            }
+
+        # Status differential: ≥1 success response and ≥1 server-error response.
+        statuses = [o.get("status") for o in observations if o.get("status")]
+        has_success = any(
+            isinstance(s, int) and 200 <= s < 300 for s in statuses
+        )
+        has_server_err = any(
+            isinstance(s, int) and 500 <= s < 600 for s in statuses
+        )
+        if has_success and has_server_err:
+            sample = next(
+                o for o in observations
+                if isinstance(o.get("status"), int)
+                and 500 <= o["status"] < 600
+            )
+            return {
+                "verified": False,
+                "kind": "xxe_status_differential",
+                "mode": "candidate",
+                "delivery": target.delivery,
+                "parameter": target.parameter,
+                "payload_id": sample.get("payload_id", "unknown"),
+                "channel": channel,
+                "url": target.url,
+                "family": "xml_parse_error",
+                "evidence": {
+                    "status_spread": sorted(set(statuses)),
+                    "response_excerpt": sample.get("body_excerpt", ""),
+                },
+                "reason": "status_differential_suggests_partial_parsing",
+                "summary": f"XXE status-differential candidate on {target.url}",
+            }
+
+        return None
 
     def _render_payload(
         self, entry: dict[str, Any], *, oob_url: str | None
