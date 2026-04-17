@@ -28,6 +28,17 @@ class DockerSandbox:
     tmpfs_tmp: str = "/tmp:rw,noexec,nosuid,size=64m"
     tmpfs_workspace: str = "/workspace:rw,nosuid,size=128m"
 
+    # Hardening (new in 3.6)
+    memory_swap: Optional[str] = None  # default: равен memory (disable swap)
+    hostname: str = "penage-sandbox"
+    use_init: bool = True
+    log_driver: str = "none"
+
+    # ulimits: имя → (soft, hard). Значения в байтах/количестве.
+    ulimit_fsize: int = 67_108_864   # 64 MiB — max file size
+    ulimit_nofile: int = 256         # max open files
+    ulimit_nproc: int = 256          # max processes (вместе с pids-limit — двойная защита)
+
     # NEW: runtime state
     _container_id: Optional[str] = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -81,6 +92,8 @@ class DockerSandbox:
         return await self._run_in_container(["python", "-c", code], timeout_s=timeout_s, cwd=cwd, env=env)
 
     def _base_docker_run_args(self, *, cwd: Optional[str], env: Optional[Dict[str, str]]) -> list[str]:
+        mem_swap = self.memory_swap if self.memory_swap is not None else self.memory
+
         docker_cmd: list[str] = [
             "docker",
             "run",
@@ -103,11 +116,29 @@ class DockerSandbox:
             str(self.pids_limit),
             "--memory",
             self.memory,
+            "--memory-swap",
+            mem_swap,
             "--cpus",
             self.cpus,
             "--user",
             self.run_as_user,
+            "--hostname",
+            self.hostname,
+            "--log-driver",
+            self.log_driver,
+            "--ulimit",
+            f"fsize={self.ulimit_fsize}:{self.ulimit_fsize}",
+            "--ulimit",
+            f"nofile={self.ulimit_nofile}:{self.ulimit_nofile}",
+            "--ulimit",
+            f"nproc={self.ulimit_nproc}:{self.ulimit_nproc}",
         ]
+
+        if self.use_init:
+            docker_cmd += ["--init"]
+
+        if "HOME" not in (env or {}):
+            docker_cmd += ["-e", "HOME=/workspace"]
         if env:
             for k, v in env.items():
                 docker_cmd += ["-e", f"{k}={v}"]
