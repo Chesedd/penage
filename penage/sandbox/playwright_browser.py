@@ -59,6 +59,12 @@ class PlaywrightBrowser:
         ``"load"`` to match the legacy :class:`BrowserVerifier`.
     navigate_timeout_ms:
         Navigation timeout in milliseconds. Surfaced as :class:`BrowserError`.
+    launch_args:
+        Extra CLI flags forwarded verbatim to ``chromium.launch(args=...)``
+        — bound to :attr:`penage.app.config.RuntimeConfig.browser_launch_args`
+        by :func:`penage.app.runtime_factory.build_browser`. Use it to
+        enable ``--no-sandbox`` / ``--disable-dev-shm-usage`` when running
+        inside rootful containers or Linux CI.
     """
 
     def __init__(
@@ -68,11 +74,13 @@ class PlaywrightBrowser:
         navigate_wait_until: str = _DEFAULT_WAIT_UNTIL,
         navigate_timeout_ms: int = _DEFAULT_NAVIGATE_TIMEOUT_MS,
         rate_limiter: RateLimiter | None = None,
+        launch_args: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self._headless: bool = bool(headless)
         self._wait_until: str = str(navigate_wait_until)
         self._timeout_ms: int = int(navigate_timeout_ms)
         self._rate_limiter: RateLimiter = rate_limiter if rate_limiter is not None else RateLimiter(None)
+        self._launch_args: list[str] = list(launch_args) if launch_args else []
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -94,7 +102,10 @@ class PlaywrightBrowser:
 
         try:
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(headless=self._headless)
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._headless,
+                args=list(self._launch_args),
+            )
             self._context = await self._browser.new_context()
             await self._context.add_init_script(_INIT_SCRIPT)
             self._page = await self._context.new_page()

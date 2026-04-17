@@ -1,0 +1,53 @@
+# DVWA E2E compose stack — used by the opt-in ``e2e_dvwa`` pytest suite.
+#
+# Usage:
+#     docker compose -f compose/e2e_dvwa.yml up -d
+#     pytest -m e2e_dvwa tests/integration/e2e/ -o addopts=
+#     docker compose -f compose/e2e_dvwa.yml down -v
+#
+# The DVWA HTTP port is bound to ``127.0.0.1:4280`` to match the default
+# ``DVWA_BASE_URL`` expected by ``tests/integration/e2e/conftest.py``.
+# The ``db`` service stays on the internal compose network only.
+#
+# Image digests are pinned by ``@sha256:…`` for reproducibility — bump
+# them deliberately after pulling + inspecting the upstream tag, e.g.:
+#     docker pull ghcr.io/digininja/dvwa:latest
+#     docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/digininja/dvwa:latest
+#     docker pull docker.io/library/mariadb:10
+#     docker inspect --format '{{index .RepoDigests 0}}' docker.io/library/mariadb:10
+# Replace ``<DIGEST_TBD>`` below with the ``sha256:…`` part of the result.
+
+services:
+  dvwa:
+    # TODO 4.4.γ: resolve real digest locally via the command above.
+    image: ghcr.io/digininja/dvwa@sha256:<DIGEST_TBD>
+    ports:
+      - "127.0.0.1:4280:80"
+    environment:
+      DB_SERVER: db
+      DB_DATABASE: dvwa
+      DB_USERNAME: dvwa
+      DB_PASSWORD: p@ssw0rd
+      DEFAULT_SECURITY_LEVEL: low
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/login.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  db:
+    # TODO 4.4.γ: resolve real digest locally via the command above.
+    image: docker.io/library/mariadb:10@sha256:<DIGEST_TBD>
+    environment:
+      MARIADB_ROOT_PASSWORD: dvwa
+      MARIADB_DATABASE: dvwa
+      MARIADB_USER: dvwa
+      MARIADB_PASSWORD: p@ssw0rd
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

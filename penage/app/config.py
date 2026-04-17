@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from argparse import Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from penage.core.guard import RunMode
@@ -82,6 +82,13 @@ class RuntimeConfig:
     # overhead). Default 4 is safe for DVWA and typical bug-bounty scope
     # — a lower value if a target is known to be fragile.
     max_concurrent_per_host: int | None = 4
+
+    # Stage 4.4 — extra args passed to ``chromium.launch(args=...)`` by
+    # :class:`penage.sandbox.playwright_browser.PlaywrightBrowser`. Default
+    # empty. Set to ``("--no-sandbox", "--disable-dev-shm-usage")`` in
+    # rootful Docker / Linux CI environments where chromium's own sandbox
+    # isn't available.
+    browser_launch_args: tuple[str, ...] = ()
 
 
 def _idor_cred_from_args_or_env(
