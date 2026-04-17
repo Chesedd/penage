@@ -73,6 +73,18 @@ Then group by domain:
 - `tests/integration/macros/...`
 - etc.
 
+## Golden-trace snapshots
+
+Regression guards for episode trace shape live under
+`tests/golden/traces/*.json` and are driven by the harness at
+`tests/support/golden_trace.py`.
+
+- Run normally: `pytest -q tests/integration/golden/` — tests fail on any
+  drift from the committed golden files.
+- Regenerate: `PENAGE_UPDATE_GOLDEN=1 pytest -q tests/integration/golden/`
+  rewrites the JSON files in place. Review the diff before committing;
+  the env var is never set in CI.
+
 ## Security note
 
 This repository should be used only for authorized targets.

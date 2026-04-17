@@ -1,0 +1,110 @@
+[
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "parameter": "q",
+      "phase": 1,
+      "phase_name": "canary_injection",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "channels": [
+        "GET",
+        "POST"
+      ],
+      "contexts": [
+        "attr_quoted"
+      ],
+      "parameter": "q",
+      "phase": 2,
+      "phase_name": "context_analysis",
+      "primary": "attr_quoted",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "parameter": "q",
+      "phase": 3,
+      "phase_name": "filter_inference",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "allowed_tags": [
+        "<script>",
+        "<img>",
+        "<svg>",
+        "<iframe>",
+        "<body>",
+        "<div>"
+      ],
+      "blocked_tags": [],
+      "parameter": "q",
+      "phase": 4,
+      "phase_name": "payload_mutation",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "candidates": 1,
+      "parameter": "q",
+      "phase": 5,
+      "phase_name": "verification",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "validation",
+    "payload": {
+      "result": {
+        "action_type": "http",
+        "evidence": {
+          "action_type": "http",
+          "execution_markers": [],
+          "js_result": "",
+          "payload": "\" onfocus=alert(1) autofocus x=\"",
+          "probe_expr": "JSON.stringify(window.__penage_xss_marker__ || [])",
+          "reflection_dom_fragment": "<html><body><div>\" onfocus=alert(1) autofocus x=\"</div></body></html>",
+          "url": "http://localhost/search?q=%22+onfocus%3Dalert%281%29+autofocus+x%3D%22"
+        },
+        "family": "http:GET:/search:q=['q']:data=[]:json=[]",
+        "kind": "xss_browser_reflection",
+        "level": "evidence",
+        "summary": "Payload reflected in rendered DOM; execution not confirmed.",
+        "url": "http://localhost/search?q=%22+onfocus%3Dalert%281%29+autofocus+x%3D%22"
+      },
+      "step": 0
+    },
+    "ts_ms": "<TS_MS>"
+  }
+]
