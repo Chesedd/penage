@@ -48,7 +48,9 @@ class ToolRunner:
 
         http_backend: HttpBackend
         if use_curl_http:
-            http_backend = CurlHttpTool.create_default(sb, allowed_hosts=allowed_hosts)
+            http_backend = CurlHttpTool.create_default(
+                sb, allowed_hosts=allowed_hosts, rate_limiter=rate_limiter,
+            )
         else:
             http_backend = HttpTool.create_default(
                 client, allowed_hosts=allowed_hosts, rate_limiter=rate_limiter,
