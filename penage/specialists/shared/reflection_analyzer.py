@@ -33,6 +33,7 @@ class ReflectionContextType(str, Enum):
     NOT_REFLECTED = "not_reflected"
     SSRF_URL_PARAM = "ssrf_url_param"
     CMDINJ_PARAM = "cmdinj_param"
+    LFI_PARAM = "lfi_param"
 
 
 @dataclass(frozen=True, slots=True)
