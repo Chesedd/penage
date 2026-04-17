@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from penage.core.actions import Action, ActionType
 from penage.core.candidates import CandidateAction
 from penage.core.observations import Observation
-from penage.core.state import State
+from penage.core.state import FilterModel, State
 from penage.core.tracer import JsonlTracer
 from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
@@ -18,6 +18,11 @@ from penage.specialists.shared.oob_listener import OobListener
 from penage.specialists.shared.path_traversal import (
     detect_lfi_markers,
     generate_traversal_variants,
+)
+from penage.specialists.shared.payload_mutator import PayloadMutator
+from penage.specialists.shared.reflection_analyzer import (
+    ReflectionContext,
+    ReflectionContextType,
 )
 from penage.tools.http_backend import HttpBackend
 
@@ -117,13 +122,15 @@ class LfiSpecialist(AsyncSpecialist):
        response body is scanned with
        :func:`penage.specialists.shared.path_traversal.detect_lfi_markers`.
        The first family-specific marker wins — the finding is verified.
-    3. **Deterministic bypass variants.** Interleaved output of
-       :func:`generate_traversal_variants` over well-known target files
+    3. **Deterministic bypass variants + LLM mutation.** Interleaved output
+       of :func:`generate_traversal_variants` over well-known target files
        (``/etc/passwd``, ``/etc/hosts``, ``C:\\Windows\\win.ini``) and the
        ``bypass`` category of ``lfi.yaml``. Priority order inside the
        generated set puts double-URL-encoded forms first, then single-URL,
-       then ``....//``, then null-byte, then raw. LLM-driven mutation is
-       added in session 2.6c-iii.
+       then ``....//``, then null-byte, then raw. When the deterministic
+       set is exhausted without a verified hit and a ``llm_client`` is
+       wired up, :class:`PayloadMutator` is asked for up to three extra
+       candidates which are then fired with the same marker check.
     4. **OOB (php://input, file:// OOB-host for RCE-chain).** Next session.
     5. **Candidate emission and finalization.** Next session.
 
@@ -352,8 +359,12 @@ class LfiSpecialist(AsyncSpecialist):
         The combined candidate set is capped at ``max_bypass_payloads * 2``
         to keep this phase from swallowing the whole HTTP budget.
 
-        LLM-driven mutation is added in session 2.6c-iii; until then this
-        method returns ``None`` when nothing is verified deterministically.
+        If the deterministic set is exhausted without a verified hit and a
+        ``llm_client`` is configured (plus enough HTTP budget remains), the
+        specialist asks :class:`PayloadMutator` for up to three additional
+        candidates and fires them. A verified mutation returns a finding with
+        ``kind == "lfi_mutation_verified"`` and ``evidence.bypass_source ==
+        "llm_mutation"``; otherwise the method returns ``None``.
         """
         _ = (config, step)
 
@@ -467,8 +478,116 @@ class LfiSpecialist(AsyncSpecialist):
                 outcome="no_signal",
             )
 
+        # Deterministic set exhausted without a verified hit — try LLM mutation.
+        if http_tool.remaining < self.min_reserve_http or self.llm_client is None:
+            self._note(
+                f"lfi:bypass_phase_no_verified deterministic_tried={deterministic_tried} "
+                f"mutation_skipped=True"
+            )
+            return None
+
+        # Synthetic reflection context: for LFI we probe a URL/form parameter,
+        # not an HTML reflection point, so no quote/tag/encoding info is known.
+        context = ReflectionContext(
+            context_type=ReflectionContextType.LFI_PARAM,
+            quote_char=None,
+            tag_parent=None,
+            encoding_observed=None,
+        )
+
+        # Empty synthetic FilterModel — LFI has no echo channel to measure
+        # character-level transforms, and the mutator is already biased by
+        # the category/context we pass in.
+        filter_model = FilterModel(
+            parameter=target.parameter, channel=target.channel
+        )
+
+        mutator = PayloadMutator(
+            llm_client=self.llm_client,
+            payload_library_path=self.payload_library_path,
+        )
+        try:
+            llm_payloads = await mutator.mutate(
+                context=context,
+                filter_model=filter_model,
+                max_candidates=3,
+            )
+        except Exception as exc:  # LEGACY: mutator boundary
+            self._note(f"lfi:mutation_error {exc}")
+            llm_payloads = []
+
+        mutation_tried = 0
+        for payload in llm_payloads:
+            if http_tool.remaining < 2:
+                break
+            p = (payload or "").strip()
+            if not p:
+                continue
+            mutation_tried += 1
+
+            probe_url, action_params = _build_probe_action(target, p)
+            action = Action(type=ActionType.HTTP, params=action_params)
+            obs = await http_tool.run(action)
+
+            if not obs.ok or not isinstance(obs.data, dict):
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=p,
+                    outcome="error",
+                )
+                continue
+
+            body = str(obs.data.get("text_full") or "")
+            status = obs.data.get("status_code")
+            hits = detect_lfi_markers(body)
+
+            if hits:
+                primary = hits[0]
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=p,
+                    outcome="verified_mutation",
+                )
+                return {
+                    "verified": True,
+                    "kind": "lfi_mutation_verified",
+                    "mode": "mutation",
+                    "parameter": target.parameter,
+                    "payload": p,
+                    "channel": target.channel,
+                    "url": probe_url,
+                    "family": primary.family.value,
+                    "evidence": {
+                        "markers": [
+                            {
+                                "family": h.family.value,
+                                "marker": h.marker,
+                                "snippet": h.snippet,
+                            }
+                            for h in hits[:5]
+                        ],
+                        "response_excerpt": body[:500],
+                        "http_status": status,
+                        "bypass_source": "llm_mutation",
+                    },
+                    "summary": (
+                        f"LFI mutation disclosure of {primary.family.value} "
+                        f"via {target.parameter}"
+                    ),
+                }
+
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=p,
+                outcome="no_signal",
+            )
+
         self._note(
-            f"lfi:bypass_phase_no_verified deterministic_tried={deterministic_tried}"
+            f"lfi:bypass_phase_no_verified deterministic_tried={deterministic_tried} "
+            f"mutation_tried={mutation_tried}"
         )
         return None
 
