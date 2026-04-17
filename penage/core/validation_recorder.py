@@ -40,10 +40,10 @@ class ValidationRecorder:
 
         self.tracer.record_validation(item, step=step)
 
-    def validate_and_record(self, st: State, action: Action, obs: Observation, *, step: int) -> None:
+    async def validate_and_record(self, st: State, action: Action, obs: Observation, *, step: int) -> None:
         if self.validator is None:
             return
-        result = self.validator.validate(action=action, obs=obs, state=st)
+        result = await self.validator.validate(action=action, obs=obs, state=st)
         if result is None:
             return
         self.record(st, action, result, step=step)

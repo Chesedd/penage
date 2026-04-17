@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 from penage.core.actions import Action
 from penage.core.observations import Observation
@@ -24,8 +24,9 @@ class ValidationResult:
         }
 
 
+@runtime_checkable
 class EvidenceValidator(Protocol):
-    def validate(
+    async def validate(
         self,
         *,
         action: Action,

@@ -47,15 +47,21 @@ def _build_candidate(
 class ValidationGate:
     """Two-stage cascade: HTTP validator → optional ValidationAgent.
 
-    Stage 1 (sync): ``http_validator.validate(...)`` classifies the
+    Stage 1: ``await http_validator.validate(...)`` classifies the
     observation. ``None`` means no finding; ``"validated"`` means a
     fast-pass (no LLM cost); any other level is a candidate.
 
-    Stage 2 (async, optional): when ``validation_mode == "agent"`` and
-    a ``validation_agent`` is configured, candidates are escalated to
+    Stage 2 (optional): when ``validation_mode == "agent"`` and a
+    ``validation_agent`` is configured, candidates are escalated to
     the LLM role. A ``pass`` verdict upgrades the result to
     ``"validated"``; a ``fail`` verdict leaves it as the original
     non-validated level and annotates the evidence.
+
+    Both stages run in the async cascade: the ``EvidenceValidator``
+    Protocol is async so that browser-backed validators
+    (``BrowserEvidenceValidator``) share one path with the HTTP
+    reflection validator. HTTP-only callers remain immediate-ready
+    (no ``await`` fires internally).
 
     Browser verification is NOT done here — it remains the
     responsibility of the specialist (e.g. ``XssSpecialist`` phase 5).
@@ -75,7 +81,7 @@ class ValidationGate:
         state: State,
         tracker: UsageTracker,
     ) -> Optional[ValidationResult]:
-        http_result = self.http_validator.validate(
+        http_result = await self.http_validator.validate(
             action=action, obs=obs, state=state,
         )
         if http_result is None:

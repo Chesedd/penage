@@ -61,8 +61,8 @@ class StateUpdater:
             ttl_steps=ttl_steps,
         )
 
-    def validate_and_record(self, st: State, action: Action, obs: Observation, *, step: int) -> None:
-        self.validation_recorder.validate_and_record(st, action, obs, step=step)
+    async def validate_and_record(self, st: State, action: Action, obs: Observation, *, step: int) -> None:
+        await self.validation_recorder.validate_and_record(st, action, obs, step=step)
 
     def update_state(self, st: State, action: Action, obs: Observation) -> None:
         self.observation_projector.project(st, action, obs)
