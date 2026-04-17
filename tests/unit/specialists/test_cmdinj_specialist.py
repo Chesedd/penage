@@ -191,31 +191,6 @@ def test_target_discovery_skip_input_types() -> None:
     assert [t.parameter for t in targets] == ["cmd"]
 
 
-@pytest.mark.asyncio
-async def test_not_implemented_phases_raise() -> None:
-    specialist = _make_specialist()
-    target = _CmdInjTarget(url="http://localhost/x", parameter="cmd", channel="GET")
-    with pytest.raises(NotImplementedError):
-        await specialist._run_blind_phase(
-            target=target,
-            http_tool=None,  # type: ignore[arg-type]
-            host="localhost",
-            baseline={},
-            os_hint=None,
-            config=SpecialistConfig(),
-            step=0,
-        )
-    with pytest.raises(NotImplementedError):
-        await specialist._run_mutation_phase(
-            target=target,
-            http_tool=None,  # type: ignore[arg-type]
-            host="localhost",
-            prior_signals={},
-            config=SpecialistConfig(),
-            step=0,
-        )
-
-
 @dataclass
 class ScriptedHttp:
     """Fake HTTP backend returning a scripted Observation per call.
@@ -542,3 +517,346 @@ def test_marker_appears_escaped_helper() -> None:
     assert _marker_appears_escaped("nothing special", "pncmd_abc") is False
     # If the marker itself is present verbatim we consider it NOT just-escaped.
     assert _marker_appears_escaped("yes pncmd_abc here &#59;", "pncmd_abc") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — blind timing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blind_sleep_consistency_verified() -> None:
+    # Three elapsed_ms probes; 2 exceed baseline + threshold -> verified.
+    http = ScriptedHttp(
+        bodies=["", "", "", "", "", "", "", "", ""],
+        elapsed_ms_seq=[6000, 6100, 300, 6200, 6300, 6400, 6500, 6600, 6700],
+    )
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=FakeLLMClient(fixed_text=""),
+        max_http_budget=40,
+        probes_per_timing_payload=3,
+        timing_hits_required=2,
+        max_blind_payloads=1,
+    )
+    target = _CmdInjTarget(url="http://localhost/ping", parameter="host", channel="GET", original_value="1")
+    budgeted = _BudgetedHttpTool(http, State(base_url="http://localhost"), cap=20)
+    baseline = {"median_s": 0.05, "std_ms": 10.0, "samples": [0.05]}
+    signals: dict[str, object] = {"reflected_escaped": [], "timing_noise": [], "blocked_probes": [], "noisy_baseline": False, "os_hint": "unknown"}
+    finding = await specialist._run_blind_phase(
+        target=target,
+        http_tool=budgeted,
+        host="localhost",
+        baseline=baseline,
+        os_hint="linux",
+        config=SpecialistConfig(),
+        step=0,
+        signals=signals,
+    )
+    assert finding is not None
+    assert finding["verified"] is True
+    assert finding["kind"] == "cmdinj_blind"
+    assert finding["mode"] == "blind"
+    assert finding["evidence"]["hits_above_threshold"] >= 2
+    assert finding["evidence"]["os_hint"] == "linux"
+    assert len(finding["evidence"]["elapsed_ms"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_blind_inconsistent_timing_unverified() -> None:
+    # Only 1 of 3 probes exceeds threshold -> not verified, timing_noise captured.
+    http = ScriptedHttp(
+        bodies=[""] * 60,
+        elapsed_ms_seq=[6000, 100, 200] + [100] * 57,
+    )
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=FakeLLMClient(fixed_text=""),
+        max_http_budget=40,
+        probes_per_timing_payload=3,
+        timing_hits_required=2,
+        max_blind_payloads=1,
+    )
+    target = _CmdInjTarget(url="http://localhost/ping", parameter="host", channel="GET", original_value="1")
+    budgeted = _BudgetedHttpTool(http, State(base_url="http://localhost"), cap=20)
+    baseline = {"median_s": 0.05, "std_ms": 10.0, "samples": [0.05]}
+    signals: dict[str, object] = {"reflected_escaped": [], "timing_noise": [], "blocked_probes": [], "noisy_baseline": False, "os_hint": "unknown"}
+    finding = await specialist._run_blind_phase(
+        target=target,
+        http_tool=budgeted,
+        host="localhost",
+        baseline=baseline,
+        os_hint="linux",
+        config=SpecialistConfig(),
+        step=0,
+        signals=signals,
+    )
+    assert finding is None
+    assert signals["timing_noise"], "timing_noise signal should be captured"
+    assert signals["timing_noise"][0]["hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_blind_noisy_baseline_skips_blind_phase() -> None:
+    http = ScriptedHttp(bodies=[""] * 20, elapsed_ms_seq=[10000] * 20)
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=FakeLLMClient(fixed_text=""),
+        max_http_budget=40,
+        probes_per_timing_payload=3,
+    )
+    target = _CmdInjTarget(url="http://localhost/ping", parameter="host", channel="GET", original_value="1")
+    budgeted = _BudgetedHttpTool(http, State(base_url="http://localhost"), cap=20)
+    # std_ms larger than timing_threshold_s * 500 (= 2500 by default).
+    baseline = {"median_s": 0.1, "std_ms": 3000.0, "samples": [0.05, 0.15]}
+    signals: dict[str, object] = {"reflected_escaped": [], "timing_noise": [], "blocked_probes": [], "noisy_baseline": False, "os_hint": "unknown"}
+    finding = await specialist._run_blind_phase(
+        target=target,
+        http_tool=budgeted,
+        host="localhost",
+        baseline=baseline,
+        os_hint="linux",
+        config=SpecialistConfig(),
+        step=0,
+        signals=signals,
+    )
+    assert finding is None
+    assert signals["noisy_baseline"] is True
+    assert http.calls == []  # phase was skipped, no HTTP calls performed
+
+
+@pytest.mark.asyncio
+async def test_blind_os_hint_linux_uses_sleep_payloads() -> None:
+    specialist = _make_specialist()
+    # Trigger a real load via a dummy _load call then inspect selection.
+    specialist._load_yaml_entries(categories=(), limit=0)
+    entries = specialist._select_blind_entries("linux")
+    categories = {e.get("category") for e in entries}
+    assert "blind-sleep-linux" in categories
+    assert "blind-sleep-windows" not in categories
+    # blind-ping entries for linux must be the ``-c`` variant only.
+    ping_entries = [e for e in entries if e.get("category") == "blind-ping"]
+    assert all("ping -c" in str(e.get("payload")) for e in ping_entries)
+
+
+@pytest.mark.asyncio
+async def test_blind_os_hint_windows_uses_timeout_payloads() -> None:
+    specialist = _make_specialist()
+    specialist._load_yaml_entries(categories=(), limit=0)
+    entries = specialist._select_blind_entries("windows")
+    categories = {e.get("category") for e in entries}
+    assert "blind-sleep-windows" in categories
+    assert "blind-sleep-linux" not in categories
+    # blind-ping entries for windows must use ``-n``.
+    ping_entries = [e for e in entries if e.get("category") == "blind-ping"]
+    assert all("ping -n" in str(e.get("payload")) for e in ping_entries)
+    # At least one Windows ``timeout /t`` payload expected.
+    assert any("timeout /t" in str(e.get("payload")) for e in entries)
+
+
+@pytest.mark.asyncio
+async def test_blind_os_hint_unknown_uses_mixed() -> None:
+    specialist = _make_specialist()
+    specialist._load_yaml_entries(categories=(), limit=0)
+    entries = specialist._select_blind_entries("unknown")
+    categories = {e.get("category") for e in entries}
+    assert {"blind-sleep-linux", "blind-sleep-windows", "blind-ping"} <= categories
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — LLM mutation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mutation_phase_triggered_when_3_and_4_fail() -> None:
+    # Echo never reflects, blind elapsed_ms never exceeds threshold,
+    # mutation phase should be invoked and trace emitted.
+    http = ScriptedHttp(
+        body_matcher=lambda action: "no reflection here",
+        elapsed_ms_seq=[100] * 200,
+    )
+
+    class _Tracer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+            self.notes: list[str] = []
+            self.episode_id = "ep1"
+
+        def write_event(self, kind: str, payload: dict) -> None:
+            self.events.append((kind, payload))
+
+        def record_note(self, text: str) -> None:
+            self.notes.append(text)
+
+    tracer = _Tracer()
+    # LLM returns a JSON array of mutated payloads.
+    llm = FakeLLMClient(fixed_text='["%3b+echo+pnmut_probe1", "\\\\;echo pnmut_probe2"]')
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=llm,
+        tracer=tracer,  # type: ignore[arg-type]
+        max_http_budget=40,
+        max_echo_payloads=1,
+        max_blind_payloads=1,
+        max_mutation_payloads=2,
+        probes_per_timing_payload=3,
+    )
+    state = State(base_url="http://localhost")
+    state.last_http_url = "http://localhost/run?host=1"
+
+    await specialist.propose_async(state, config=SpecialistConfig())
+
+    phases = [payload.get("phase") for kind, payload in tracer.events if kind == "specialist_phase"]
+    assert 5 in phases, f"expected phase 5 trace, got {phases}"
+    phase5 = next(p for k, p in tracer.events if k == "specialist_phase" and p.get("phase") == 5)
+    assert phase5["phase_name"] == "payload_mutation"
+    assert "candidates_generated" in phase5
+    assert "payloads_fired" in phase5
+    assert "destructive_dropped" in phase5
+
+
+@pytest.mark.asyncio
+async def test_mutation_destructive_dropped_with_note() -> None:
+    http = ScriptedHttp(body_matcher=lambda action: "")
+
+    class _Tracer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict]] = []
+            self.notes: list[str] = []
+            self.episode_id = "ep1"
+
+        def write_event(self, kind: str, payload: dict) -> None:
+            self.events.append((kind, payload))
+
+        def record_note(self, text: str) -> None:
+            self.notes.append(text)
+
+    tracer = _Tracer()
+    # Mutator returns a clearly destructive payload + a benign one.
+    llm = FakeLLMClient(fixed_text='["; rm -rf /", "; echo ok"]')
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=llm,
+        tracer=tracer,  # type: ignore[arg-type]
+        max_http_budget=40,
+        max_mutation_payloads=2,
+    )
+    target = _CmdInjTarget(url="http://localhost/x", parameter="cmd", channel="GET", original_value="1")
+    budgeted = _BudgetedHttpTool(http, State(base_url="http://localhost"), cap=20)
+    signals: dict[str, object] = {"reflected_escaped": [], "timing_noise": [], "blocked_probes": [], "noisy_baseline": False, "os_hint": "unknown"}
+
+    await specialist._run_mutation_phase(
+        target=target,
+        http_tool=budgeted,
+        host="localhost",
+        prior_signals=signals,
+        config=SpecialistConfig(),
+        step=0,
+        baseline={"median_s": 0.0, "std_ms": 0.0},
+    )
+
+    # Exactly one HTTP call (the benign payload).
+    assert len(http.calls) == 1
+    # Destructive drop was noted.
+    assert any("destructive_payload_dropped" in n for n in tracer.notes)
+    # Trace shows destructive_dropped == 1.
+    phase5 = next(p for k, p in tracer.events if k == "specialist_phase" and p.get("phase") == 5)
+    assert phase5.get("destructive_dropped") == 1
+
+
+# ---------------------------------------------------------------------------
+# Candidate emission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_candidate_reflected_no_exec_score_3() -> None:
+    specialist = _make_specialist()
+    target = _CmdInjTarget(url="http://localhost/x", parameter="cmd", channel="GET", original_value="1")
+    signals: dict[str, object] = {
+        "reflected_escaped": [{"payload": "; echo X", "separator": ";"}],
+        "timing_noise": [],
+        "blocked_probes": [],
+        "noisy_baseline": False,
+        "os_hint": "unknown",
+    }
+    finding = specialist._build_candidate_finding(target=target, signals=signals)
+    assert finding is not None
+    assert finding["verified"] is False
+    assert finding["kind"] == "cmdinj_reflected_no_exec"
+    specialist._findings.append(finding)
+    [candidate] = specialist._emit_if_any()
+    assert candidate.score == 3.0
+
+
+@pytest.mark.asyncio
+async def test_candidate_timing_noise_score_3() -> None:
+    specialist = _make_specialist()
+    target = _CmdInjTarget(url="http://localhost/x", parameter="cmd", channel="GET", original_value="1")
+    signals: dict[str, object] = {
+        "reflected_escaped": [],
+        "timing_noise": [{"payload": "; sleep 5", "elapsed_ms": [6000, 100, 100], "hits": 1}],
+        "blocked_probes": [],
+        "noisy_baseline": False,
+        "os_hint": "linux",
+    }
+    finding = specialist._build_candidate_finding(target=target, signals=signals)
+    assert finding is not None
+    assert finding["kind"] == "cmdinj_timing_noise"
+    assert finding["reason"] == "insufficient_timing_consistency"
+    specialist._findings.append(finding)
+    [candidate] = specialist._emit_if_any()
+    assert candidate.score == 3.0
+
+
+@pytest.mark.asyncio
+async def test_candidate_blocked_score_2() -> None:
+    specialist = _make_specialist()
+    target = _CmdInjTarget(url="http://localhost/x", parameter="cmd", channel="GET", original_value="1")
+    signals: dict[str, object] = {
+        "reflected_escaped": [],
+        "timing_noise": [],
+        "blocked_probes": [
+            {"payload": "; echo A", "status": 403},
+            {"payload": "&& echo B", "status": 403},
+        ],
+        "noisy_baseline": False,
+        "os_hint": "unknown",
+    }
+    finding = specialist._build_candidate_finding(target=target, signals=signals)
+    assert finding is not None
+    assert finding["kind"] == "cmdinj_blocked"
+    assert finding["reason"] == "waf_or_input_validation"
+    specialist._findings.append(finding)
+    [candidate] = specialist._emit_if_any()
+    assert candidate.score == 2.0
+
+
+@pytest.mark.asyncio
+async def test_verified_prevents_candidate_emit() -> None:
+    # A verified echo finding is emitted as-is; candidate signals are ignored.
+    def _echo_back(action: Action) -> str:
+        url = action.params.get("url", "")
+        data = action.params.get("data") or {}
+        body = url + " " + " ".join(str(v) for v in data.values())
+        return body
+
+    http = ScriptedHttp(body_matcher=_echo_back)
+    specialist = CmdInjSpecialist(
+        http_tool=http,
+        llm_client=FakeLLMClient(fixed_text=""),
+        max_http_budget=40,
+        baseline_samples=2,
+        max_echo_payloads=2,
+        max_fingerprint_payloads=1,
+    )
+    state = State(base_url="http://localhost")
+    state.last_http_url = "http://localhost/run?host=1"
+
+    [candidate] = await specialist.propose_async(state, config=SpecialistConfig())
+    finding = candidate.metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "cmdinj_echo"
+    # verified echo scores 13.0, not a 2.0/3.0 candidate.
+    assert candidate.score == 13.0

@@ -11,12 +11,17 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from penage.core.actions import Action, ActionType
 from penage.core.candidates import CandidateAction
 from penage.core.observations import Observation
-from penage.core.state import State
+from penage.core.state import FilterModel, State
 from penage.core.tracer import JsonlTracer
 from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
 from penage.specialists.shared.destructive_filter import DestructiveCommandFilter
+from penage.specialists.shared.payload_mutator import PayloadMutator
+from penage.specialists.shared.reflection_analyzer import (
+    ReflectionContext,
+    ReflectionContextType,
+)
 from penage.tools.http_backend import HttpBackend
 
 logger = logging.getLogger(__name__)
@@ -113,15 +118,18 @@ class CmdInjSpecialist(AsyncSpecialist):
        encoding bypasses and retry; every mutated payload is still screened
        through :class:`DestructiveCommandFilter`.
 
-    This iteration implements **phases 1-3.5** (target discovery, baseline
-    timing, echo-marker reflection, OS fingerprint). Phases 4-5 (blind timing
-    and LLM-guided payload mutation) still raise ``NotImplementedError`` and
-    are filled in by sessions 2.9b-iv / 2.9c.
+    Evidence gate (CLAUDE.md invariant #4): ``verified=True`` is only emitted
+    on (a) an echo-marker match in the response body or (b) ≥2-of-3 elapsed_ms
+    probes exceeding ``timing_threshold_s`` above the baseline. All other
+    positive signals (HTML-escaped marker reflection, 1-of-3 timing noise,
+    WAF-style block statuses) are emitted as ``verified=False`` candidates
+    with the corresponding ``kind`` / ``reason``.
 
-    SECURITY INVARIANT (CLAUDE.md #4): every payload — base or mutated — must
-    pass through ``self._filter.check(...)`` before leaving the specialist.
-    Destructive commands are allowed only when ``allow_destructive=True``,
-    which is itself opt-in and logged in the trace by the filter's caller.
+    SECURITY INVARIANT (CLAUDE.md #4): every payload — base, YAML-curated, or
+    LLM-mutated — passes through :class:`DestructiveCommandFilter` at phases
+    3, 4 and 5 before leaving the specialist. Destructive commands are
+    allowed only when ``allow_destructive=True``, which is itself opt-in and
+    logged in the trace by the filter's caller.
     """
 
     name: ClassVar[str] = "cmdinj"
@@ -143,6 +151,8 @@ class CmdInjSpecialist(AsyncSpecialist):
     max_echo_payloads: int = 8
     max_blind_payloads: int = 4
     max_fingerprint_payloads: int = 3
+    max_mutation_payloads: int = 4
+    blocked_probe_threshold: int = 2
 
     allow_destructive: bool = False
 
@@ -186,12 +196,18 @@ class CmdInjSpecialist(AsyncSpecialist):
                 break
 
             host = _host_of(target.url)
+            signals: dict[str, Any] = {
+                "reflected_escaped": [],   # list[{"payload": str, "separator": str}]
+                "timing_noise": [],        # list[{"payload": str, "elapsed_ms": list[int]}]
+                "blocked_probes": [],      # list[{"payload": str, "status": int}]
+                "noisy_baseline": False,
+                "os_hint": "unknown",
+            }
 
             self._trace_phase(1, "target_discovery", step=step, target=target)
 
             self._trace_phase(2, "baseline_timing", step=step, target=target)
             baseline = await self._measure_baseline(target, budgeted)
-            _ = baseline  # baseline is consumed by phase 4 (blind timing)
 
             self._trace_phase(3, "echo_reflection_probes", step=step, target=target)
             echo_finding = await self._run_echo_phase(
@@ -200,25 +216,68 @@ class CmdInjSpecialist(AsyncSpecialist):
                 host=host,
                 config=config,
                 step=step,
+                signals=signals,
             )
 
             if echo_finding and echo_finding.get("verified"):
                 if budgeted.remaining >= self.min_reserve_http:
                     self._trace_phase(35, "os_fingerprint", step=step, target=target)
-                    os_hint, signals = await self._run_fingerprint_phase(
+                    os_hint, fp_signals = await self._run_fingerprint_phase(
                         target=target,
                         http_tool=budgeted,
                         config=config,
                         step=step,
                     )
                     echo_finding["evidence"]["os_hint"] = os_hint
-                    echo_finding["evidence"]["fingerprint_signals"] = signals
+                    echo_finding["evidence"]["fingerprint_signals"] = fp_signals
                 self._findings.append(echo_finding)
                 self._done = True
                 self._attempted.add(key)
                 break
 
-            # Phases 4 (blind timing) and 5 (mutation) are not yet wired in.
+            # Phase 4 — blind timing. Requires a baseline; noisy baselines
+            # degrade the detector and are skipped.
+            blind_finding: dict[str, Any] | None = None
+            if baseline is not None and budgeted.remaining >= self.probes_per_timing_payload:
+                blind_finding = await self._run_blind_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    baseline=baseline,
+                    os_hint=signals["os_hint"],
+                    config=config,
+                    step=step,
+                    signals=signals,
+                )
+
+            if blind_finding is not None and blind_finding.get("verified"):
+                self._findings.append(blind_finding)
+                self._done = True
+                self._attempted.add(key)
+                break
+
+            # Phase 5 — LLM mutation, only when 3 and 4 yielded no verified signal
+            # and we still have enough HTTP budget.
+            if budgeted.remaining >= self.min_reserve_http:
+                mutation_finding = await self._run_mutation_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    prior_signals=signals,
+                    baseline=baseline,
+                    config=config,
+                    step=step,
+                )
+                if mutation_finding is not None and mutation_finding.get("verified"):
+                    self._findings.append(mutation_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
+            candidate = self._build_candidate_finding(target=target, signals=signals)
+            if candidate is not None:
+                self._findings.append(candidate)
+
             self._attempted.add(key)
 
         return self._emit_if_any()
@@ -227,17 +286,21 @@ class CmdInjSpecialist(AsyncSpecialist):
         if not self._findings:
             return []
         finding = self._findings[-1]
-        tag = "verified" if finding.get("verified") else "unverified"
+        verified = bool(finding.get("verified"))
+        kind = str(finding.get("kind") or "cmdinj_finding")
+        mode = str(finding.get("mode") or "unknown")
+        tag = "verified" if verified else "unverified"
+        score = _score_for_finding(verified, kind)
         action = Action(
             type=ActionType.NOTE,
-            params={"kind": "cmdinj_finding", "finding": finding},
-            tags=["cmdinj", tag, finding.get("mode", "unknown")],
+            params={"kind": kind, "finding": finding},
+            tags=["cmdinj", tag, mode],
         )
         return [
             CandidateAction(
                 action=action,
                 source=self.name,
-                score=13.0 if finding.get("verified") else 3.0,
+                score=score,
                 cost=0.0,
                 reason=finding.get("summary") or "CmdInj finding",
                 metadata={"evidence": finding},
@@ -281,12 +344,17 @@ class CmdInjSpecialist(AsyncSpecialist):
         host: str,
         config: SpecialistConfig,
         step: int,
+        signals: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Phase 3: fire echo-reflection payloads with a unique per-probe marker.
 
         Returns a verified finding dict on marker match, otherwise ``None``.
         Every payload — even from the curated YAML library — is re-screened
         through :attr:`_filter` (CLAUDE.md invariant #4).
+
+        When ``signals`` is provided, escaped-marker reflections and WAF-style
+        block statuses are recorded into it so phases 4 and 5 can use them as
+        a filter model / candidate input.
         """
         _ = (config, step)
         entries = self._load_yaml_entries(
@@ -360,6 +428,13 @@ class CmdInjSpecialist(AsyncSpecialist):
 
             if _marker_appears_escaped(body, marker):
                 outcome = "reflected_no_exec"
+                if signals is not None:
+                    signals["reflected_escaped"].append(
+                        {
+                            "payload": raw_payload,
+                            "separator": str(entry.get("separator") or ""),
+                        }
+                    )
             else:
                 outcome = "no_signal"
             self._record_attempt(
@@ -368,6 +443,10 @@ class CmdInjSpecialist(AsyncSpecialist):
                 payload=raw_payload,
                 outcome=outcome,
             )
+            if signals is not None and isinstance(status, int) and status in (400, 403, 500):
+                signals["blocked_probes"].append(
+                    {"payload": raw_payload, "status": int(status)}
+                )
 
         return None
 
@@ -459,8 +538,188 @@ class CmdInjSpecialist(AsyncSpecialist):
         os_hint: str | None,
         config: SpecialistConfig,
         step: int,
+        signals: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.9c")
+        """Phase 4: timing-based blind probes.
+
+        For each selected YAML entry, fire ``probes_per_timing_payload``
+        requests and count probes whose elapsed delta exceeds
+        ``timing_threshold_s``. ``timing_hits_required``-of-``probes`` is
+        enough for a verified finding. Every payload still passes through
+        :class:`DestructiveCommandFilter` (CLAUDE.md invariant #4).
+
+        If the baseline standard deviation is already too close to the
+        detection threshold (``baseline_std_ms > timing_threshold_s * 500``),
+        the whole phase degrades with a ``cmdinj:noisy_baseline`` warning
+        to keep false-positive rate sane.
+        """
+        _ = (config, step)
+        os_value = (os_hint or "unknown").lower()
+        baseline_std_ms = float(baseline.get("std_ms") or 0.0)
+        noise_limit_ms = float(self.timing_threshold_s) * 1000.0 / 2.0
+        if baseline_std_ms > noise_limit_ms:
+            self._note(
+                f"cmdinj:noisy_baseline std_ms={baseline_std_ms:.1f} "
+                f"threshold_ms={noise_limit_ms:.1f}"
+            )
+            if signals is not None:
+                signals["noisy_baseline"] = True
+            self._trace_phase(
+                4,
+                "blind_timing_probes",
+                step=step,
+                target=target,
+                extra={
+                    "payloads_tried": 0,
+                    "hits": 0,
+                    "baseline_ms": int(baseline.get("median_s", 0.0) * 1000.0),
+                    "baseline_std_ms": int(baseline_std_ms),
+                    "skipped_reason": "noisy_baseline",
+                },
+            )
+            return None
+
+        entries = self._select_blind_entries(os_value)
+        if not entries:
+            self._trace_phase(
+                4,
+                "blind_timing_probes",
+                step=step,
+                target=target,
+                extra={
+                    "payloads_tried": 0,
+                    "hits": 0,
+                    "baseline_ms": int(baseline.get("median_s", 0.0) * 1000.0),
+                    "baseline_std_ms": int(baseline_std_ms),
+                },
+            )
+            return None
+
+        baseline_s = float(baseline.get("median_s") or 0.0)
+        baseline_ms_int = int(baseline_s * 1000.0)
+        payloads_tried = 0
+        total_hits = 0
+        verified: dict[str, Any] | None = None
+
+        for entry in entries[: self.max_blind_payloads]:
+            raw_payload = str(entry.get("payload") or "")
+            if not raw_payload:
+                continue
+            verdict = self._filter.check(raw_payload)
+            if not verdict.allowed:
+                self._note(
+                    f"cmdinj:destructive_payload_dropped id={entry.get('id')} "
+                    f"reason={verdict.reason}"
+                )
+                continue
+
+            if http_tool.remaining < self.probes_per_timing_payload:
+                break
+
+            full_payload = f"{target.original_value}{raw_payload}"
+            probe_url, action_params = _build_probe_action(target, full_payload)
+
+            elapsed_ms: list[int] = []
+            last_body = ""
+            last_status: int | None = None
+            for _ in range(self.probes_per_timing_payload):
+                if http_tool.remaining < 1:
+                    break
+                action = Action(
+                    type=ActionType.HTTP,
+                    params=action_params,
+                    timeout_s=max(12.0, self.timing_threshold_s * 3.0),
+                    tags=["cmdinj", "blind"],
+                )
+                obs = await http_tool.run(action)
+                if obs.ok and obs.elapsed_ms is not None:
+                    elapsed_ms.append(int(obs.elapsed_ms))
+                    if isinstance(obs.data, dict):
+                        last_body = str(obs.data.get("text_full") or last_body)
+                        status_value = obs.data.get("status_code")
+                        if isinstance(status_value, int):
+                            last_status = status_value
+            payloads_tried += 1
+
+            hits = sum(
+                1
+                for ms in elapsed_ms
+                if (ms / 1000.0 - baseline_s) >= self.timing_threshold_s
+            )
+            total_hits += hits
+
+            if hits >= self.timing_hits_required:
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=raw_payload,
+                    outcome="verified_blind",
+                )
+                verified = {
+                    "verified": True,
+                    "kind": "cmdinj_blind",
+                    "mode": "blind",
+                    "parameter": target.parameter,
+                    "payload": raw_payload,
+                    "channel": target.channel,
+                    "url": probe_url,
+                    "separator": str(entry.get("separator") or ""),
+                    "evidence": {
+                        "marker": None,
+                        "elapsed_ms": list(elapsed_ms),
+                        "baseline_ms": baseline_ms_int,
+                        "baseline_std_ms": int(baseline_std_ms),
+                        "hits_above_threshold": hits,
+                        "os_hint": os_value,
+                        "response_excerpt": last_body[:500],
+                        "http_status": last_status,
+                    },
+                    "summary": (
+                        f"Blind command injection via {target.parameter} ({os_value})"
+                    ),
+                }
+                break
+
+            if hits >= 1 and signals is not None:
+                signals["timing_noise"].append(
+                    {
+                        "payload": raw_payload,
+                        "elapsed_ms": list(elapsed_ms),
+                        "hits": hits,
+                    }
+                )
+                outcome = "timing_inconsistent"
+            else:
+                outcome = "no_signal"
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=raw_payload,
+                outcome=outcome,
+            )
+            if (
+                signals is not None
+                and last_status is not None
+                and last_status in (400, 403, 500)
+            ):
+                signals["blocked_probes"].append(
+                    {"payload": raw_payload, "status": int(last_status)}
+                )
+
+        self._trace_phase(
+            4,
+            "blind_timing_probes",
+            step=step,
+            target=target,
+            extra={
+                "payloads_tried": payloads_tried,
+                "hits": total_hits,
+                "baseline_ms": baseline_ms_int,
+                "baseline_std_ms": int(baseline_std_ms),
+                "os_hint": os_value,
+            },
+        )
+        return verified
 
     async def _run_mutation_phase(
         self,
@@ -471,8 +730,336 @@ class CmdInjSpecialist(AsyncSpecialist):
         prior_signals: dict[str, Any],
         config: SpecialistConfig,
         step: int,
+        baseline: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.9c")
+        """Phase 5: LLM-guided mutation of separators / encodings.
+
+        Builds a :class:`FilterModel` from ``prior_signals`` (escaped
+        separators → ``transformed_chars``, WAF statuses → ``blocked_events``),
+        asks :class:`PayloadMutator` for up to five candidates, screens each
+        through :class:`DestructiveCommandFilter`, and fires them. Echo-style
+        payloads are searched for an injected marker; sleep/timeout/ping-style
+        payloads are compared against the baseline elapsed_ms.
+        """
+        _ = (config, step)
+        if self.llm_client is None:
+            return None
+
+        context = ReflectionContext(context_type=ReflectionContextType.CMDINJ_PARAM)
+
+        transformed: dict[str, str] = {
+            str(item.get("separator") or ""): "escaped"
+            for item in prior_signals.get("reflected_escaped", [])
+            if str(item.get("separator") or "")
+        }
+        blocked_events: list[str] = sorted(
+            {str(item.get("status")) for item in prior_signals.get("blocked_probes", [])}
+        )
+        filter_model = FilterModel(
+            parameter=target.parameter,
+            channel=target.channel,
+            transformed_chars=transformed,
+            blocked_events=blocked_events,
+        )
+
+        mutator = PayloadMutator(
+            llm_client=self.llm_client,
+            payload_library_path=self.payload_library_path,
+        )
+
+        try:
+            candidates = await mutator.mutate(
+                context,
+                filter_model,
+                max_candidates=5,
+            )
+        except Exception as exc:  # LEGACY: mutator already swallows LLM errors
+            logger.warning("cmdinj mutation call failed: %s", exc)
+            self._note(f"cmdinj:mutation_error:{exc}")
+            candidates = []
+
+        candidates_generated = len(candidates)
+        payloads_fired = 0
+        destructive_dropped = 0
+        baseline_s = float((baseline or {}).get("median_s") or 0.0)
+        verified: dict[str, Any] | None = None
+
+        for raw_payload in candidates[: self.max_mutation_payloads]:
+            if http_tool.remaining < 1:
+                break
+            if not raw_payload:
+                continue
+
+            verdict = self._filter.check(raw_payload)
+            if not verdict.allowed:
+                destructive_dropped += 1
+                self._note(
+                    f"cmdinj:destructive_payload_dropped id=mutation "
+                    f"reason={verdict.reason}"
+                )
+                continue
+
+            token = uuid.uuid4().hex[:12]
+            marker = f"pncmd_{token}"
+            exec_payload = raw_payload.replace("{MARKER}", marker)
+            mode = _classify_mutation_mode(exec_payload)
+
+            full_payload = f"{target.original_value}{exec_payload}"
+            probe_url, action_params = _build_probe_action(target, full_payload)
+            timeout_s = (
+                max(12.0, self.timing_threshold_s * 3.0) if mode == "blind" else 12.0
+            )
+            action = Action(
+                type=ActionType.HTTP,
+                params=action_params,
+                timeout_s=timeout_s,
+                tags=["cmdinj", "mutation"],
+            )
+            obs = await http_tool.run(action)
+            payloads_fired += 1
+
+            if not obs.ok or not isinstance(obs.data, dict):
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=exec_payload,
+                    outcome="error",
+                )
+                continue
+
+            body = str(obs.data.get("text_full") or "")
+            status = obs.data.get("status_code") if isinstance(obs.data, dict) else None
+
+            if mode == "echo" and "{MARKER}" in raw_payload and marker in body:
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=exec_payload,
+                    outcome="verified_echo_mutation",
+                )
+                verified = {
+                    "verified": True,
+                    "kind": "cmdinj_echo",
+                    "mode": "echo",
+                    "parameter": target.parameter,
+                    "payload": exec_payload,
+                    "channel": target.channel,
+                    "url": probe_url,
+                    "separator": "",
+                    "evidence": {
+                        "marker": marker,
+                        "response_excerpt": body[:500],
+                        "os_hint": prior_signals.get("os_hint") or "unknown",
+                        "fingerprint_signals": [],
+                        "http_status": status,
+                        "via_mutation": True,
+                    },
+                    "summary": (
+                        f"Command injection via {target.parameter} (echo, mutated)"
+                    ),
+                }
+                break
+
+            if mode == "blind" and obs.elapsed_ms is not None:
+                elapsed_s = obs.elapsed_ms / 1000.0
+                if elapsed_s - baseline_s >= self.timing_threshold_s:
+                    self._record_attempt(
+                        host=host,
+                        parameter=target.parameter,
+                        payload=exec_payload,
+                        outcome="verified_blind_mutation",
+                    )
+                    verified = {
+                        "verified": True,
+                        "kind": "cmdinj_blind",
+                        "mode": "blind",
+                        "parameter": target.parameter,
+                        "payload": exec_payload,
+                        "channel": target.channel,
+                        "url": probe_url,
+                        "separator": "",
+                        "evidence": {
+                            "marker": None,
+                            "elapsed_ms": [int(obs.elapsed_ms)],
+                            "baseline_ms": int(baseline_s * 1000.0),
+                            "baseline_std_ms": int(
+                                float((baseline or {}).get("std_ms") or 0.0)
+                            ),
+                            "hits_above_threshold": 1,
+                            "os_hint": prior_signals.get("os_hint") or "unknown",
+                            "response_excerpt": body[:500],
+                            "http_status": status,
+                            "via_mutation": True,
+                        },
+                        "summary": (
+                            f"Blind command injection via {target.parameter} "
+                            f"({prior_signals.get('os_hint') or 'unknown'}, mutated)"
+                        ),
+                    }
+                    break
+
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=exec_payload,
+                outcome="no_signal",
+            )
+            if isinstance(status, int) and status in (400, 403, 500):
+                prior_signals.setdefault("blocked_probes", []).append(
+                    {"payload": exec_payload, "status": int(status)}
+                )
+
+        self._trace_phase(
+            5,
+            "payload_mutation",
+            step=step,
+            target=target,
+            extra={
+                "candidates_generated": candidates_generated,
+                "payloads_fired": payloads_fired,
+                "destructive_dropped": destructive_dropped,
+            },
+        )
+        return verified
+
+    def _select_blind_entries(self, os_hint: str) -> list[dict[str, Any]]:
+        """Return YAML entries suited for the given OS hint.
+
+        - ``linux``   → ``blind-sleep-linux`` + ``blind-ping`` (os=linux).
+        - ``windows`` → ``blind-sleep-windows`` + ``blind-ping`` (os=windows).
+        - ``unknown`` → all three categories, in YAML order.
+        """
+        # Force a load via the cached helper (limit=0 still caches).
+        self._load_yaml_entries(categories=(), limit=0)
+        cache = self._yaml_cache or []
+        if os_hint == "linux":
+            return [
+                e
+                for e in cache
+                if e.get("category") in {"blind-sleep-linux", "blind-ping"}
+                and str(e.get("os") or "").lower() in {"linux", "any"}
+            ]
+        if os_hint == "windows":
+            return [
+                e
+                for e in cache
+                if e.get("category") in {"blind-sleep-windows", "blind-ping"}
+                and str(e.get("os") or "").lower() in {"windows", "any"}
+            ]
+        return [
+            e
+            for e in cache
+            if e.get("category")
+            in {"blind-sleep-linux", "blind-sleep-windows", "blind-ping"}
+        ]
+
+    def _build_candidate_finding(
+        self,
+        *,
+        target: _CmdInjTarget,
+        signals: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Derive a ``verified=False`` candidate from accumulated signals.
+
+        Priority: reflected_no_exec > timing_noise > blocked. Each maps to a
+        distinct ``kind`` / ``reason`` per the specialist's contract. Also
+        records a ``no_signal`` / ``blocked`` attempt into memory so future
+        episodes can skip obviously fruitless surfaces.
+        """
+        reflected = signals.get("reflected_escaped") or []
+        timing_noise = signals.get("timing_noise") or []
+        blocked = signals.get("blocked_probes") or []
+
+        if reflected:
+            first = reflected[0]
+            payload = str(first.get("payload") or "")
+            self._record_attempt(
+                host=_host_of(target.url),
+                parameter=target.parameter,
+                payload=payload,
+                outcome="no_signal",
+            )
+            return {
+                "verified": False,
+                "kind": "cmdinj_reflected_no_exec",
+                "mode": "reflected_no_exec",
+                "parameter": target.parameter,
+                "payload": payload,
+                "channel": target.channel,
+                "url": target.url,
+                "separator": str(first.get("separator") or ""),
+                "evidence": {
+                    "reflected_separators": [
+                        str(r.get("separator") or "") for r in reflected
+                    ],
+                    "os_hint": signals.get("os_hint") or "unknown",
+                },
+                "reason": "marker_escaped_not_executed",
+                "summary": (
+                    f"CmdInj candidate on {target.parameter}: separator reflected "
+                    f"in escaped form (no execution)"
+                ),
+            }
+
+        if timing_noise:
+            first = timing_noise[0]
+            payload = str(first.get("payload") or "")
+            self._record_attempt(
+                host=_host_of(target.url),
+                parameter=target.parameter,
+                payload=payload,
+                outcome="no_signal",
+            )
+            return {
+                "verified": False,
+                "kind": "cmdinj_timing_noise",
+                "mode": "timing_noise",
+                "parameter": target.parameter,
+                "payload": payload,
+                "channel": target.channel,
+                "url": target.url,
+                "separator": "",
+                "evidence": {
+                    "elapsed_ms": list(first.get("elapsed_ms") or []),
+                    "hits": int(first.get("hits") or 0),
+                    "os_hint": signals.get("os_hint") or "unknown",
+                },
+                "reason": "insufficient_timing_consistency",
+                "summary": (
+                    f"CmdInj candidate on {target.parameter}: single timing hit, "
+                    f"not reproducible"
+                ),
+            }
+
+        if len(blocked) >= self.blocked_probe_threshold:
+            first = blocked[0]
+            payload = str(first.get("payload") or "")
+            self._record_attempt(
+                host=_host_of(target.url),
+                parameter=target.parameter,
+                payload=payload,
+                outcome="blocked",
+            )
+            return {
+                "verified": False,
+                "kind": "cmdinj_blocked",
+                "mode": "blocked",
+                "parameter": target.parameter,
+                "payload": payload,
+                "channel": target.channel,
+                "url": target.url,
+                "separator": "",
+                "evidence": {
+                    "statuses": [int(b.get("status") or 0) for b in blocked],
+                    "count": len(blocked),
+                },
+                "reason": "waf_or_input_validation",
+                "summary": (
+                    f"CmdInj candidate on {target.parameter}: "
+                    f"{len(blocked)} probes blocked (WAF/validation)"
+                ),
+            }
+        return None
 
     def _discover_targets(self, state: State) -> list[_CmdInjTarget]:
         priority: list[_CmdInjTarget] = []
@@ -655,3 +1242,32 @@ def _host_of(url: str) -> str:
         return (urlparse(url).netloc or "").lower()
     except Exception:
         return ""
+
+
+_BLIND_KEYWORDS: tuple[str, ...] = ("sleep", "timeout /t", "timeout\t/t", "ping -c", "ping -n")
+
+
+def _classify_mutation_mode(payload: str) -> str:
+    """Heuristic echo/blind discriminator for mutated payloads."""
+    low = payload.lower()
+    if "echo" in low:
+        return "echo"
+    for needle in _BLIND_KEYWORDS:
+        if needle in low:
+            return "blind"
+    return "echo"
+
+
+_SCORE_BY_KIND: dict[str, float] = {
+    "cmdinj_echo": 13.0,
+    "cmdinj_blind": 11.0,
+    "cmdinj_reflected_no_exec": 3.0,
+    "cmdinj_timing_noise": 3.0,
+    "cmdinj_blocked": 2.0,
+}
+
+
+def _score_for_finding(verified: bool, kind: str) -> float:
+    if kind in _SCORE_BY_KIND:
+        return _SCORE_BY_KIND[kind]
+    return 13.0 if verified else 3.0
