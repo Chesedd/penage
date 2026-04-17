@@ -21,6 +21,7 @@ from penage.policy.gctr_lite import GctrLitePolicy
 from penage.sandbox.base import Sandbox
 from penage.sandbox.docker import DockerSandbox
 from penage.sandbox.null import NullSandbox
+from penage.sandbox.playwright_browser import PlaywrightBrowser
 from penage.specialists.auth_session_confusion import AuthSessionConfusionSpecialist
 from penage.specialists.curl_recon import CurlReconSpecialist
 from penage.specialists.login_workflow import LoginWorkflowSpecialist
@@ -246,6 +247,19 @@ def build_memory(cfg: RuntimeConfig) -> MemoryStore:
     return MemoryStore(cfg.memory_db_path)
 
 
+def build_browser(cfg: RuntimeConfig) -> PlaywrightBrowser | None:
+    """Return a :class:`PlaywrightBrowser` when browser verification is on.
+
+    Returns ``None`` if ``cfg.browser_verification`` is false so the
+    validation gate falls back to its HTTP-only path. Aclose of the returned
+    instance is the caller's responsibility — the orchestrator chains it
+    into episode teardown (see invariant #11).
+    """
+    if not cfg.browser_verification:
+        return None
+    return PlaywrightBrowser()
+
+
 def build_validation_gate(
     cfg: RuntimeConfig,
     llm: LLMClient,
@@ -279,6 +293,12 @@ def build_orchestrator(
     memory: MemoryStore | None = None,
 ) -> Orchestrator:
     sandbox_agents = build_sandbox_agents(llm)
+
+    browser = build_browser(cfg)
+    browser_validator = (
+        BrowserEvidenceValidator(browser) if browser is not None else None
+    )
+
     return Orchestrator(
         llm=llm,
         tools=tools,
@@ -293,8 +313,11 @@ def build_orchestrator(
         ),
         macro_executor=build_macro_executor(),
         memory=memory,
-        validation_gate=build_validation_gate(cfg, llm),
+        validation_gate=build_validation_gate(
+            cfg, llm, browser_validator=browser_validator,
+        ),
         sandbox_agents=sandbox_agents,
+        browser=browser,
     )
 
 

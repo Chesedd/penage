@@ -19,6 +19,7 @@ from penage.llm.base import LLMClient
 from penage.macros.base import MacroExecutor
 from penage.memory.store import MemoryStore
 from penage.policy.base import PolicyLayer
+from penage.sandbox.browser_base import Browser
 from penage.specialists.manager import SpecialistManager
 from penage.tools.runner import ToolRunner
 from penage.utils.fingerprint import action_fingerprint
@@ -51,6 +52,7 @@ class Orchestrator:
     coordinator: Optional[CoordinatorAgent] = None
     memory: Optional[MemoryStore] = None
     sandbox_agents: Optional[dict[str, SandboxAgent]] = None
+    browser: Optional[Browser] = None
 
     def __post_init__(self) -> None:
         if self.state_updater is None:
@@ -110,6 +112,11 @@ class Orchestrator:
                 await self.tools.aclose()
             except Exception:  # LEGACY: defensive cleanup, never hide user exceptions
                 pass
+            if self.browser is not None:
+                try:
+                    await self.browser.aclose()
+                except Exception:  # LEGACY: defensive cleanup, never hide user exceptions
+                    pass
 
         return st, tracker
 
