@@ -155,6 +155,7 @@ class Orchestrator:
                 return StepOutcome(stop=True, reason=f"stop_condition:{reason}")
 
         if early_stop is not None:
+            tracker.observe_step(st, step)
             stop_reason = tracker.check_early_stop(early_stop)
             if stop_reason:
                 self.tracer.record_note(f"early_stop: {stop_reason}", step=step)
@@ -259,6 +260,7 @@ class Orchestrator:
             return StepOutcome(stop=True, reason="budget_exhausted:total_text_len")
 
         self.tracer.record_action(a, step=step, agent="coordinator")
+        tracker.record_action_fingerprint(action_fingerprint(a))
 
         a = self.form_assist.normalize_http_post(a, st)
 
