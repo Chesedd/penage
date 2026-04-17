@@ -1,0 +1,197 @@
+# Curated XXE (XML External Entity) payloads for authorized security testing.
+#
+# Each entry:
+#   id:            stable identifier
+#   category:      classic-unix | classic-windows | parameter_entity-unix |
+#                  oob_blind-unix | error-based | soap-wrapped |
+#                  billion-laughs | no-doctype-sanity
+#   template:      classic | parameter_entity | oob_blind
+#                  (describes the structural family; specialist uses this to
+#                  pick the build helper in penage.specialists.shared.xml_utils)
+#   uri:           absolute URI substituted into {URI} by the build helper.
+#                  For oob_blind-unix entries this is the literal placeholder
+#                  "{OOB_URL}"; the specialist resolves it at runtime from
+#                  its configured listener (penage.specialists.shared.oob_listener).
+#   entity_name:   optional — only meaningful for template=classic.
+#                  Omitted when not applicable (parameter_entity, oob_blind).
+#   content_type:  header value to send with the body.
+#   notes:         short human-facing rationale and expected signal.
+#
+# SECURITY: XXE is read-only disclosure (or OOB exfiltration). No payload here
+# writes or mutates server state. The billion-laughs entry is RESOURCE-EXHAUSTION
+# and MUST remain behind an explicit opt-in flag per CLAUDE.md invariant #4;
+# the XxeSpecialist is expected to gate it on allow_dos=True and emit a trace
+# warning before dispatch.
+
+# --- classic-unix ---
+- id: xxe-classic-passwd
+  category: classic-unix
+  template: classic
+  uri: "file:///etc/passwd"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Baseline in-band SYSTEM entity reading /etc/passwd. Expect unix_passwd marker."
+
+- id: xxe-classic-hosts
+  category: classic-unix
+  template: classic
+  uri: "file:///etc/hosts"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "World-readable /etc/hosts — low-risk canary confirming entity expansion works at all."
+
+- id: xxe-classic-proc-version
+  category: classic-unix
+  template: classic
+  uri: "file:///proc/version"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "/proc/version echoes kernel banner; trips entity_expansion detector when passwd is blocked."
+
+- id: xxe-classic-proc-environ
+  category: classic-unix
+  template: classic
+  uri: "file:///proc/self/environ"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Environment of the XML parser process; high value for leaked tokens/creds."
+
+# --- classic-windows ---
+- id: xxe-classic-win-ini
+  category: classic-windows
+  template: classic
+  uri: "file:///C:/Windows/win.ini"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Classic win.ini disclosure; expect win_ini marker on [fonts]/[extensions]."
+
+- id: xxe-classic-win-hosts
+  category: classic-windows
+  template: classic
+  uri: "file:///C:/Windows/System32/drivers/etc/hosts"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Windows hosts file; distinguishable via Microsoft Corp. header banner."
+
+- id: xxe-classic-boot-ini
+  category: classic-windows
+  template: classic
+  uri: "file:///C:/boot.ini"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Legacy boot.ini — rare post-Vista but trivial and high-confidence on older targets."
+
+# --- parameter_entity-unix ---
+# Parameter entities (%foo;) bypass parsers that block &-entities but allow %.
+- id: xxe-param-passwd
+  category: parameter_entity-unix
+  template: parameter_entity
+  uri: "file:///etc/passwd"
+  content_type: "application/xml"
+  notes: "Parameter-entity variant of /etc/passwd read; exercises parsers that block & but allow %."
+
+- id: xxe-param-hosts
+  category: parameter_entity-unix
+  template: parameter_entity
+  uri: "file:///etc/hosts"
+  content_type: "application/xml"
+  notes: "Parameter-entity canary on /etc/hosts; mirrors classic-unix-hosts for the %-entity path."
+
+- id: xxe-param-proc-version
+  category: parameter_entity-unix
+  template: parameter_entity
+  uri: "file:///proc/version"
+  content_type: "application/xml"
+  notes: "Parameter-entity /proc/version; trips entity_expansion detector on 'Linux version' echo."
+
+# --- oob_blind-unix ---
+# uri=={OOB_URL} is a placeholder resolved at dispatch time. The specialist
+# attaches a listener and replaces {OOB_URL} with a fresh per-request URL so
+# that disclosures are correlated to a specific probe, not shared globally.
+- id: xxe-oob-passwd
+  category: oob_blind-unix
+  template: oob_blind
+  uri: "{OOB_URL}"
+  content_type: "application/xml"
+  notes: "Blind OOB exfiltration of /etc/passwd — requires a listener serving the secondary DTD."
+
+- id: xxe-oob-environ
+  category: oob_blind-unix
+  template: oob_blind
+  uri: "{OOB_URL}"
+  content_type: "application/xml"
+  notes: "Blind OOB exfiltration of /proc/self/environ; high value for credential leaks via env."
+
+- id: xxe-oob-hostname
+  category: oob_blind-unix
+  template: oob_blind
+  uri: "{OOB_URL}"
+  content_type: "application/xml"
+  notes: "Blind OOB read of /etc/hostname; small body, good for confirming the OOB chain end-to-end."
+
+# --- error-based ---
+# Error-based XXE relies on a parser that surfaces file content inside its
+# error message (e.g. 'failed to load external entity "..."'). Three distinct
+# shapes to maximise coverage across parsers.
+- id: xxe-error-cyclic-entity
+  category: error-based
+  template: classic
+  uri: "file:///etc/passwd"
+  entity_name: err
+  content_type: "application/xml"
+  notes: "Cyclic entity forces parser error; some parsers embed the file URI or contents in the diagnostic."
+
+- id: xxe-error-entity-in-attribute
+  category: error-based
+  template: classic
+  uri: "file:///etc/passwd"
+  entity_name: err
+  content_type: "application/xml"
+  notes: "Entity used inside an attribute value; triggers parser error with fragment echo on some stacks."
+
+- id: xxe-error-entity-in-cdata
+  category: error-based
+  template: classic
+  uri: "file:///etc/passwd"
+  entity_name: err
+  content_type: "application/xml"
+  notes: "Entity reference placed near a CDATA section; some parsers mis-expand and leak contents in the error."
+
+# --- soap-wrapped ---
+# Some SOAP endpoints accept XXE only when the payload is wrapped in a valid
+# Envelope/Body and sent with text/xml. These variants preserve the same
+# SYSTEM-entity trick inside a SOAP shell.
+- id: xxe-soap-passwd
+  category: soap-wrapped
+  template: classic
+  uri: "file:///etc/passwd"
+  entity_name: xxe
+  content_type: "text/xml"
+  notes: "SOAP-wrapped XXE (text/xml); many SOAP stacks reject raw XML but accept an Envelope."
+
+- id: xxe-soap-win-ini
+  category: soap-wrapped
+  template: classic
+  uri: "file:///C:/Windows/win.ini"
+  entity_name: xxe
+  content_type: "text/xml"
+  notes: "SOAP-wrapped win.ini read; Windows .NET SOAP endpoints are a common hit."
+
+# --- billion-laughs ---
+# DoS-style payload — KEEP OFF BY DEFAULT. Listed for inventory completeness.
+- id: xxe-billion-laughs
+  category: billion-laughs
+  template: classic
+  uri: "file:///dev/null"
+  entity_name: lol
+  content_type: "application/xml"
+  notes: "DoS risk — specialist must have max_xxe_entity_depth guard; gate on explicit opt-in. For reference only; not sent without allow_dos=True."
+
+# --- no-doctype-sanity ---
+- id: xxe-sanity-no-doctype
+  category: no-doctype-sanity
+  template: classic
+  uri: "file:///dev/null"
+  entity_name: xxe
+  content_type: "application/xml"
+  notes: "Baseline probe to confirm the endpoint accepts XML at all; no DOCTYPE processing expected."
