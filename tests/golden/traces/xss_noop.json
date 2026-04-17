@@ -1,0 +1,29 @@
+[
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "parameter": "q",
+      "phase": 1,
+      "phase_name": "canary_injection",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  },
+  {
+    "episode_id": "<EPISODE_ID>",
+    "event": "specialist_phase",
+    "payload": {
+      "parameter": "q",
+      "phase": 2,
+      "phase_name": "context_analysis",
+      "result": "not_reflected",
+      "specialist": "xss",
+      "step": 0,
+      "url": "http://localhost/search"
+    },
+    "ts_ms": "<TS_MS>"
+  }
+]
