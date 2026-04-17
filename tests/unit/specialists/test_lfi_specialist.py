@@ -587,3 +587,231 @@ async def test_phase_3_no_hit_returns_none_no_findings_appended():
     assert len(http_tool.calls) > 8
     # No verified findings recorded.
     assert specialist._findings == []
+
+
+# --- Phase 3 (LLM mutation tail) -----------------------------------------
+
+
+class _FakeTracer:
+    """Minimal tracer that captures notes/events in memory (no file I/O)."""
+
+    episode_id = "fake-episode"
+
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+        self.events: list[tuple[str, dict]] = []
+
+    def record_note(self, text: str, *, step: int | None = None) -> None:
+        self.notes.append(text)
+
+    def write_event(self, event: str, payload: dict) -> None:
+        self.events.append((event, dict(payload)))
+
+
+class _FakeLLM:
+    """LLMClient placeholder — ``PayloadMutator`` is mocked, so this is
+    only here to satisfy the ``self.llm_client is None`` gate.
+    """
+
+    provider_name = "fake"
+
+
+def _make_fake_mutator(
+    *,
+    payloads: list[str] | None = None,
+    raises: Exception | None = None,
+    log: list[tuple] | None = None,
+):
+    """Factory for a drop-in fake ``PayloadMutator`` class.
+
+    ``log`` (if provided) receives ``("init",)`` on construction and
+    ``("mutate", max_candidates, context_type_value)`` on each ``mutate``
+    call — tests use it to prove the mutator was or wasn't invoked.
+    """
+
+    class _FakeMutator:
+        def __init__(self, *, llm_client, payload_library_path) -> None:
+            if log is not None:
+                log.append(("init",))
+
+        async def mutate(self, *, context, filter_model, max_candidates):
+            if log is not None:
+                log.append(("mutate", max_candidates, context.context_type.value))
+            if raises is not None:
+                raise raises
+            return list(payloads or [])
+
+    return _FakeMutator
+
+
+@pytest.mark.asyncio
+async def test_phase_3_mutation_triggered_when_deterministic_fails(monkeypatch):
+    base_url = "http://localhost/view"
+    parameter = "file"
+    log: list[tuple] = []
+    monkeypatch.setattr(
+        "penage.specialists.vulns.lfi.PayloadMutator",
+        _make_fake_mutator(
+            payloads=["llm-payload-1", "llm-payload-2"], log=log
+        ),
+    )
+
+    http_tool = FakeHttp(
+        responder=lambda a: _ok(
+            "<html>no marker</html>", url=str(a.params.get("url"))
+        )
+    )
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        llm_client=_FakeLLM(),
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter)
+
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # Mutator was constructed and mutate() was called once with the LFI context.
+    assert ("init",) in log
+    mutate_entries = [entry for entry in log if entry[0] == "mutate"]
+    assert len(mutate_entries) == 1
+    assert mutate_entries[0][1] == 3  # max_candidates
+    assert mutate_entries[0][2] == "lfi_param"
+    # Both LLM payloads were fired against the target parameter.
+    fired = [_param_value(c, parameter) for c in http_tool.calls]
+    assert "llm-payload-1" in fired
+    assert "llm-payload-2" in fired
+
+
+@pytest.mark.asyncio
+async def test_phase_3_mutation_skipped_if_no_llm_client(monkeypatch):
+    log: list[tuple] = []
+    monkeypatch.setattr(
+        "penage.specialists.vulns.lfi.PayloadMutator",
+        _make_fake_mutator(payloads=["should-not-fire"], log=log),
+    )
+
+    tracer = _FakeTracer()
+    http_tool = FakeHttp(
+        responder=lambda a: _ok(
+            "<html>no marker</html>", url=str(a.params.get("url"))
+        )
+    )
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        llm_client=None,
+        tracer=tracer,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target("http://localhost/view", "file")
+
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # Mutator must not be constructed or called when no llm_client is wired.
+    assert log == []
+    fired = [_param_value(c, "file") for c in http_tool.calls]
+    assert "should-not-fire" not in fired
+    assert any("mutation_skipped=True" in n for n in tracer.notes)
+
+
+@pytest.mark.asyncio
+async def test_phase_3_mutation_skipped_if_budget_low(monkeypatch):
+    log: list[tuple] = []
+    monkeypatch.setattr(
+        "penage.specialists.vulns.lfi.PayloadMutator",
+        _make_fake_mutator(payloads=["should-not-fire"], log=log),
+    )
+
+    tracer = _FakeTracer()
+    http_tool = FakeHttp(
+        responder=lambda a: _ok(
+            "<html>no marker</html>", url=str(a.params.get("url"))
+        )
+    )
+    # Budget 20 is enough to enter phase 3 (remaining=12 after phase 2's 8
+    # probes, 12 >= min_reserve_http=10) but phase 3 deterministic then
+    # drains 8 more, leaving remaining=4 < 10 at the mutation gate.
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        llm_client=_FakeLLM(),
+        tracer=tracer,
+        max_http_budget=20,
+        min_reserve_http=10,
+    )
+    state = _state_with_query_target("http://localhost/view", "file")
+
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    assert not any(entry[0] == "mutate" for entry in log)
+    fired = [_param_value(c, "file") for c in http_tool.calls]
+    assert "should-not-fire" not in fired
+    assert any("mutation_skipped=True" in n for n in tracer.notes)
+
+
+@pytest.mark.asyncio
+async def test_phase_3_mutation_payload_verified(monkeypatch):
+    base_url = "http://localhost/view"
+    parameter = "file"
+    magic = "llm-magic-mutation"
+    monkeypatch.setattr(
+        "penage.specialists.vulns.lfi.PayloadMutator",
+        _make_fake_mutator(payloads=[magic]),
+    )
+
+    http_tool = FakeHttp(
+        responder=_magic_payload_responder(parameter, magic, body_on_hit=PASSWD_BODY),
+    )
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=MemoryStore(":memory:"),
+        llm_client=_FakeLLM(),
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter)
+
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "lfi_mutation_verified"
+    assert finding["mode"] == "mutation"
+    assert finding["family"] == "unix_passwd"
+    assert finding["payload"] == magic
+    assert finding["evidence"]["bypass_source"] == "llm_mutation"
+
+
+@pytest.mark.asyncio
+async def test_phase_3_mutation_error_logged_no_crash(monkeypatch):
+    log: list[tuple] = []
+    monkeypatch.setattr(
+        "penage.specialists.vulns.lfi.PayloadMutator",
+        _make_fake_mutator(raises=RuntimeError("boom"), log=log),
+    )
+
+    tracer = _FakeTracer()
+    http_tool = FakeHttp(
+        responder=lambda a: _ok(
+            "<html>no marker</html>", url=str(a.params.get("url"))
+        )
+    )
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        llm_client=_FakeLLM(),
+        tracer=tracer,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target("http://localhost/view", "file")
+
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # mutate() was called and raised, but the specialist handled it gracefully.
+    assert any(entry[0] == "mutate" for entry in log)
+    assert any(n.startswith("lfi:mutation_error") for n in tracer.notes)
+    # Zero mutation HTTP calls fired past the failure.
+    assert any(
+        "bypass_phase_no_verified" in n and "mutation_tried=0" in n
+        for n in tracer.notes
+    )
