@@ -4,6 +4,7 @@ from penage.specialists.vulns.sqli import SqliSpecialist
 from penage.specialists.vulns.ssrf import SsrfSpecialist
 from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
+from penage.specialists.vulns.xxe import XxeSpecialist
 
 __all__ = [
     "CmdInjSpecialist",
@@ -12,4 +13,5 @@ __all__ = [
     "SsrfSpecialist",
     "SstiSpecialist",
     "XssSpecialist",
+    "XxeSpecialist",
 ]
