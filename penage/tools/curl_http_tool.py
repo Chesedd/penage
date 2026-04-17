@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 
 from penage.core.actions import Action
 from penage.core.observations import Observation
+from penage.core.rate_limit import RateLimiter
 from penage.sandbox.base import Sandbox
 from penage.tools.http_support import build_http_observation, http_action_error, resolve_allowed_hosts
 
@@ -21,11 +22,22 @@ _DEFAULT_UA = (
 class CurlHttpTool:
     sandbox: Sandbox
     allowed_hosts: set[str]
+    rate_limiter: RateLimiter
     cookie_jar_path: str = "/tmp/penage_cookies.txt"
 
     @classmethod
-    def create_default(cls, sandbox: Sandbox, allowed_hosts: Optional[Iterable[str]] = None) -> "CurlHttpTool":
-        return cls(sandbox=sandbox, allowed_hosts=resolve_allowed_hosts(allowed_hosts))
+    def create_default(
+        cls,
+        sandbox: Sandbox,
+        allowed_hosts: Optional[Iterable[str]] = None,
+        *,
+        rate_limiter: RateLimiter | None = None,
+    ) -> "CurlHttpTool":
+        return cls(
+            sandbox=sandbox,
+            allowed_hosts=resolve_allowed_hosts(allowed_hosts),
+            rate_limiter=rate_limiter if rate_limiter is not None else RateLimiter(None),
+        )
 
     async def aclose(self) -> None:
         return None
@@ -105,7 +117,8 @@ class CurlHttpTool:
         cmd = _shell_join(curl_parts)
 
         t0 = time.perf_counter()
-        res = await self.sandbox.run_shell(cmd=cmd, timeout_s=float(timeout_s))
+        async with self.rate_limiter.acquire(eff_url):
+            res = await self.sandbox.run_shell(cmd=cmd, timeout_s=float(timeout_s))
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
         if not res.ok:
