@@ -30,6 +30,11 @@ from penage.core.guard import RunMode
 
 ProviderName = Literal["openai", "anthropic", "ollama"]
 
+# The full ``python:3.12`` image ships curl, which the coordinator's early
+# shell-based recon relies on. Slimmer Python images lack curl and cause
+# recon to abort with exit 127, masking downstream specialist signals.
+_DEFAULT_SANDBOX_IMAGE = "python:3.12"
+
 
 @dataclass(frozen=True)
 class LlmChoice:
@@ -192,7 +197,7 @@ def build_dvwa_runtime_config(
         enable_specialists=True,
         policy_enabled=True,
         sandbox_backend=sandbox_backend,
-        docker_image="python:3.12-slim",
+        docker_image=_DEFAULT_SANDBOX_IMAGE,
         docker_network="none",
         experiment_tag=experiment_tag,
         allowed_hosts=(allowed_host,),
