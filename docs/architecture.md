@@ -238,6 +238,131 @@ This updates things such as:
 Trace events are written as JSONL.
 At the end of the episode, a structured summary JSON is written.
 
+## Multi-agent architecture (Stage 3)
+
+From Stage 3 onwards the runtime is organized as a MAPTA-style three-role
+agent system. The `Orchestrator` is a bus that wires the roles together,
+keeps per-episode state, and mediates every action + observation. Each role
+runs with an isolated LLM context and its own usage accounting.
+
+### Role diagram
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      Orchestrator (bus)                     │
+│  ┌─────────────────┐  ┌───────────────┐  ┌──────────────┐   │
+│  │ CoordinatorAgent│  │ SandboxAgents │  │ValidationGate│   │
+│  │   (planning)    │  │ (proxy × 7)   │  │              │   │
+│  └────────┬────────┘  └───────┬───────┘  └──────┬───────┘   │
+│           │                   │                 │           │
+│           ▼                   ▼                 ▼           │
+│    plan actions        propose via        validate obs      │
+│       (role=coordinator)   Specialist     http → agent*     │
+│                       (role=sandbox,                        │
+│                       specialist=<name>)  *if mode=agent    │
+└─────────────────────────────────────────────────────────────┘
+                      │ run_episode (tracker bound via ContextVar)
+                      ▼
+              DockerSandbox (per-episode persistent)
+              + HttpTool + MemoryStore + JsonlTracer
+```
+
+- **CoordinatorAgent** — high-level planner. Receives the observation +
+  planner context, emits the next action plan. Only the coordinator role
+  invokes the planner LLM. Role tag: `coordinator`.
+- **SandboxAgent** — per-specialist LLM proxy. `build_sandbox_agents(llm)`
+  creates one `RoleTaggedLLMClient` per specialist. `SpecialistManager`
+  wires each LLM-driven specialist to its own proxy (never a shared client),
+  so that token usage is attributed per specialist. Role tag: `sandbox`,
+  with `specialist=<name>` in the per-specialist usage map.
+- **ValidationAgent** — optional LLM escalator invoked by `ValidationGate`
+  when the HTTP cascade is inconclusive. By contract the agent may only
+  confirm or refute a candidate finding — never propose new ones. Role
+  tag: `validation`.
+
+### Flow of a single step
+
+`run_episode → _run_step → _run_action`:
+
+1. Budget + stop-condition + (optional) correlation early-stop checks run
+   at the top of the step.
+2. Specialists propose candidates in parallel via
+   `SpecialistProposalRunner` (`asyncio.gather`), ablation-ready via
+   `parallel_specialists=False`.
+3. `CoordinatorAgent` picks actions (LLM-call under `role=coordinator`).
+4. The policy layer arbitrates between planner actions and specialist
+   candidates, producing the final batched action list.
+5. `_run_action` executes each action in the batch:
+   - `tools.run(...)` or `macros.run(...)` with the action fingerprint
+     recorded in the `UsageTracker`.
+   - The observation goes through `ValidationGate`: HTTP cascade first,
+     then optional agent escalation when `validation_mode=agent`.
+   - A memory attempt records the outcome for cross-episode reuse.
+
+### Per-episode Docker hardening
+
+In sandboxed mode the daemon container is created lazily on the first
+exec and torn down in `try/finally` via `tools.aclose()` inside
+`run_episode`. All sandbox calls inside the episode reuse the same
+container. Hardening lives in
+`DockerSandbox._base_docker_run_args`:
+
+| Flag                    | Value                 | Purpose                          |
+|-------------------------|-----------------------|----------------------------------|
+| `--network none`        | (default)             | Network isolation                |
+| `--read-only`           | rootfs read-only      | Tamper-resistant fs              |
+| `--cap-drop ALL`        | —                     | Remove all Linux capabilities    |
+| `--security-opt`        | no-new-privileges     | No suid escalation               |
+| `--memory`              | `512m`                | RAM cap                          |
+| `--memory-swap`         | = memory              | Disable swap bypass              |
+| `--cpus`                | `1`                   | CPU share                        |
+| `--pids-limit`          | `256`                 | Process cap (belt)               |
+| `--ulimit nproc`        | `256:256`             | Process cap (suspenders)         |
+| `--ulimit fsize`        | `64M:64M`             | Max file size (disk bomb guard)  |
+| `--ulimit nofile`       | `256:256`             | Max open files                   |
+| `--init`                | —                     | Zombie reaper                    |
+| `--log-driver none`     | —                     | No log flooding                  |
+| `--hostname`            | `penage-sandbox`      | No host leak                     |
+| `--user`                | `1000:1000`           | Non-root                         |
+| `--tmpfs /tmp`          | 64M, noexec, nosuid   | Ephemeral scratch                |
+| `--tmpfs /workspace`    | 128M, nosuid          | Ephemeral workspace              |
+| `-e HOME=/workspace`    | —                     | Writable HOME for non-root       |
+
+`persistent=False` still exists as an ephemeral fallback (used in tests)
+and applies the same hardening flags.
+
+### Correlation-based early stopping
+
+Three correlation signals sit on top of the raw cap thresholds. Each one
+is ablation-ready via a `None` default.
+
+- `max_no_evidence_steps` — stop after N consecutive steps without an
+  increase in `validation_evidence_count`.
+- `max_policy_source_streak` — cap on `state.same_policy_source_streak`
+  (how long one policy source dominates selection).
+- `max_action_repeat_ratio` — ratio of repeats in the last
+  `action_repeat_window` actions.
+
+Snapshots are taken in `UsageTracker.observe_step(state, step)` and
+`UsageTracker.record_action_fingerprint(fp)`, and checked via
+`check_early_stop(thresholds)` before each step.
+
+### Ablation matrix
+
+Every major lever in the multi-agent runtime is ablation-ready. Each of
+these flags is exercised by `tests/integration/test_e2e_ablation.py`.
+
+| CLI flag                           | Default    | Effect when disabled/altered           |
+|------------------------------------|------------|----------------------------------------|
+| `--validation-mode {http,agent}`   | `http`     | `agent` turns on LLM escalation in gate|
+| `--no-parallel-specialists`        | off        | Specialists executed sequentially      |
+| `--max-no-evidence-steps INT`      | `None`     | Correlation stop off when None         |
+| `--max-policy-source-streak INT`   | `None`     | Correlation stop off when None         |
+| `--max-action-repeat-ratio FLOAT`  | `None`     | Correlation stop off when None         |
+| `--action-repeat-window INT`       | `10`       | Window for repeat-ratio                |
+| `--mode {sandboxed, safe-http}`    | CLI-driven | sandboxed → DockerSandbox persistent;  |
+|                                    |            | safe-http → NullSandbox / ephemeral    |
+
 ## Execution modes
 
 ## `safe-http`
