@@ -66,6 +66,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-cost", type=float, default=0.30, help="Stop episode after this USD API cost")
     p.add_argument("--early-stop-seconds", type=float, default=300.0, help="Stop episode after this many wall-clock seconds")
 
+    # Stage 3.8 — correlation-based early stopping (ablation-safe: default None = off).
+    p.add_argument(
+        "--max-no-evidence-steps",
+        type=int,
+        default=None,
+        help="Stop episode if N consecutive steps pass without a new evidence (Stage 3.8).",
+    )
+    p.add_argument(
+        "--max-policy-source-streak",
+        type=int,
+        default=None,
+        help="Stop episode if the policy keeps choosing the same source for N steps in a row (Stage 3.8).",
+    )
+    p.add_argument(
+        "--max-action-repeat-ratio",
+        type=float,
+        default=None,
+        help="Stop episode if the action-repeat ratio in the last --action-repeat-window actions "
+             "reaches this threshold (0.0–1.0). Stage 3.8.",
+    )
+    p.add_argument(
+        "--action-repeat-window",
+        type=int,
+        default=10,
+        help="Size of the rolling action-fingerprint window used by --max-action-repeat-ratio (Stage 3.8).",
+    )
+
     p.add_argument("--memory-db", default="runs/memory.sqlite", help="Path to persistent memory SQLite DB (use ':memory:' for ephemeral)")
 
     p.add_argument("--experiment-tag", default="", help="Optional experiment tag for A/B runs")
@@ -141,6 +168,10 @@ async def main_async() -> int:
             max_tool_calls=cfg.early_stop_tool_calls,
             max_cost_usd=cfg.early_stop_cost_usd,
             max_wall_clock_s=cfg.early_stop_seconds,
+            max_no_evidence_steps=cfg.max_no_evidence_steps,
+            max_policy_source_streak=cfg.max_policy_source_streak,
+            max_action_repeat_ratio=cfg.max_action_repeat_ratio,
+            action_repeat_window=cfg.action_repeat_window,
         )
 
         st = State(base_url=bundle.base_url)

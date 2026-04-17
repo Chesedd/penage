@@ -46,6 +46,12 @@ class RuntimeConfig:
     early_stop_cost_usd: float = 0.30
     early_stop_seconds: float = 300.0
 
+    # Stage 3.8 — correlation-based early stopping. None = signal disabled.
+    max_no_evidence_steps: int | None = None
+    max_policy_source_streak: int | None = None
+    max_action_repeat_ratio: float | None = None
+    action_repeat_window: int = 10
+
     # Memory store
     memory_db_path: str = "runs/memory.sqlite"
 
@@ -130,6 +136,22 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         early_stop_tool_calls=int(getattr(args, "early_stop_tool_calls", 40) or 40),
         early_stop_cost_usd=float(getattr(args, "early_stop_cost", 0.30) or 0.30),
         early_stop_seconds=float(getattr(args, "early_stop_seconds", 300.0) or 300.0),
+        max_no_evidence_steps=(
+            int(getattr(args, "max_no_evidence_steps"))
+            if getattr(args, "max_no_evidence_steps", None) is not None
+            else None
+        ),
+        max_policy_source_streak=(
+            int(getattr(args, "max_policy_source_streak"))
+            if getattr(args, "max_policy_source_streak", None) is not None
+            else None
+        ),
+        max_action_repeat_ratio=(
+            float(getattr(args, "max_action_repeat_ratio"))
+            if getattr(args, "max_action_repeat_ratio", None) is not None
+            else None
+        ),
+        action_repeat_window=int(getattr(args, "action_repeat_window", 10) or 10),
         memory_db_path=str(getattr(args, "memory_db", "runs/memory.sqlite") or "runs/memory.sqlite"),
         experiment_tag=str(getattr(args, "experiment_tag", "") or ""),
         allowed_hosts=tuple(str(x) for x in getattr(args, "allowed_host", []) or []),
