@@ -196,7 +196,7 @@ def _meaningful_redirect_location(location: str) -> bool:
 @dataclass(slots=True)
 class HttpEvidenceValidator:
 
-    def validate(
+    async def validate(
         self,
         *,
         action: Action,

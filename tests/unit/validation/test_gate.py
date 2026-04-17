@@ -22,7 +22,7 @@ class StubHttpValidator:
     result: Optional[ValidationResult] = None
     calls: int = 0
 
-    def validate(
+    async def validate(
         self,
         *,
         action: Action,
