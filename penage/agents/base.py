@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -33,6 +33,6 @@ class Agent:
     role: AgentRole
     system_prompt: str
     llm_client: LLMClient
-    usage_tracker: UsageTracker
+    usage_tracker: UsageTracker = field(default_factory=UsageTracker)
     tool_set: Any = None
     context_window: int = 0
