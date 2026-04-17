@@ -7,7 +7,7 @@ from penage.core.observations import Observation
 from penage.core.state import State
 from penage.sandbox.browser_base import Browser
 from penage.sandbox.fake_browser import FakeBrowser
-from penage.validation.browser import BrowserEvidenceValidator
+from penage.validation.browser import BrowserEvidenceValidator, MARKERS_JSON_EXPR
 
 
 _MARKER = "__penage_xss_marker__"
@@ -98,7 +98,7 @@ async def test_validator_returns_evidence_when_reflected_without_execution():
     payload = "<script>__penage_xss_marker__</script>"
     fake = FakeBrowser(
         dom_responses={url: f"<html><body>reflected: {payload}</body></html>"},
-        js_responses={_PROBE: ""},
+        js_responses={_PROBE: "", MARKERS_JSON_EXPR: "[]"},
     )
     validator = BrowserEvidenceValidator(browser=fake)
 
@@ -110,7 +110,9 @@ async def test_validator_returns_evidence_when_reflected_without_execution():
     assert result.kind == "xss_browser_reflection"
     assert result.evidence["url"] == url
     assert result.evidence["payload"] == payload
-    assert fake.js_calls == [_PROBE]
+    assert result.evidence["execution_markers"] == []
+    assert payload in result.evidence["reflection_dom_fragment"]
+    assert fake.js_calls == [_PROBE, MARKERS_JSON_EXPR]
 
 
 @pytest.mark.asyncio
@@ -119,7 +121,10 @@ async def test_validator_returns_validated_when_probe_marker_present():
     payload = "<script>__penage_xss_marker__</script>"
     fake = FakeBrowser(
         dom_responses={url: f"<html><body>reflected: {payload}</body></html>"},
-        js_responses={_PROBE: _MARKER},
+        js_responses={
+            _PROBE: _MARKER,
+            MARKERS_JSON_EXPR: '[{"type": "alert", "message": "1"}]',
+        },
     )
     validator = BrowserEvidenceValidator(browser=fake)
 
@@ -130,7 +135,36 @@ async def test_validator_returns_validated_when_probe_marker_present():
     assert result.level == "validated"
     assert result.kind == "xss_browser_execution"
     assert result.evidence["js_result"] == _MARKER
-    assert fake.js_calls == [_PROBE]
+    markers = result.evidence["execution_markers"]
+    assert markers == [{"type": "alert", "message": "1"}]
+    assert fake.js_calls == [_PROBE, MARKERS_JSON_EXPR]
+
+
+@pytest.mark.asyncio
+async def test_validator_validated_via_markers_array_only():
+    """Default probe returns an opaque value but the marker JSON is populated.
+
+    This mirrors the real Playwright path, where ``window.__penage_xss_marker__``
+    is an array of dialog records: ``str(arr)`` in Python does not contain
+    the marker substring, so execution must be recognised via the JSON probe.
+    """
+    url = "http://target/vuln?q=payload"
+    payload = "<script>alert(1)</script>"
+    fake = FakeBrowser(
+        dom_responses={url: f"<html><body>reflected: {payload}</body></html>"},
+        js_responses={
+            _PROBE: "[object Object]",
+            MARKERS_JSON_EXPR: '[{"type": "alert", "message": "1"}]',
+        },
+    )
+    validator = BrowserEvidenceValidator(browser=fake)
+
+    action = _browser_action(url=url, payload=payload)
+    result = await validator.validate(action=action, obs=_obs(), state=State())
+
+    assert result is not None
+    assert result.level == "validated"
+    assert result.evidence["execution_markers"] == [{"type": "alert", "message": "1"}]
 
 
 @pytest.mark.asyncio
@@ -152,7 +186,10 @@ async def test_validator_respects_custom_markers_and_probe():
 
     assert result is not None
     assert result.level == "validated"
-    assert fake.js_calls == ["window.custom_marker"]
+    # Custom probe fires first; markers JSON probe runs too (returns None →
+    # empty list), but execution is still detected via the custom marker.
+    assert fake.js_calls == ["window.custom_marker", MARKERS_JSON_EXPR]
+    assert result.evidence["execution_markers"] == []
 
 
 @pytest.mark.asyncio
