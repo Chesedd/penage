@@ -5,6 +5,7 @@ import pytest
 
 from tests.support.e2e_config import (
     LlmChoice,
+    build_dvwa_runtime_config,
     detect_llm_choice,
     detect_sandbox_backend,
 )
@@ -120,3 +121,20 @@ class TestDetectSandboxBackend:
     def test_blank_env_falls_back_to_docker(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PENAGE_E2E_SANDBOX_BACKEND", "   ")
         assert detect_sandbox_backend() == "docker"
+
+
+class TestBuildDvwaRuntimeConfig:
+    def test_docker_image_defaults_to_full_python(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("PENAGE_E2E_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("PENAGE_E2E_LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("PENAGE_E2E_SANDBOX_BACKEND", "null")
+        cfg = build_dvwa_runtime_config(
+            base_url="http://127.0.0.1:4280",
+            trace_path=tmp_path / "trace.jsonl",
+            target_url="http://127.0.0.1:4280/vulnerabilities/xss_r/",
+            allowed_host="127.0.0.1",
+            experiment_tag="unit-test",
+        )
+        assert cfg.docker_image == "python:3.12"

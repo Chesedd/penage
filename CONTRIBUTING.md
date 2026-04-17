@@ -103,7 +103,11 @@ so they need a working LLM and a Docker sandbox:
 2. **Docker Desktop** running — required for the sandbox backend
    (shell-based recon). Set `PENAGE_E2E_SANDBOX_BACKEND=null` to fall
    back to the null sandbox (note: some recon actions won't run).
-3. Bring DVWA up, run pytest, tear down:
+3. **Sandbox image prerequisite** — `docker pull python:3.12` before
+   the first E2E run. The full image provides curl (which
+   `python:3.12-slim` lacks); penage's coordinator uses curl-based
+   shell recon in early steps.
+4. Bring DVWA up, run pytest, tear down:
 
    ```bash
    docker compose -f compose/e2e_dvwa.yml up -d
