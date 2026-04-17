@@ -36,7 +36,7 @@ from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
 from penage.specialists.vulns.xxe import XxeSpecialist
 from penage.tools.runner import ToolRunner
-from penage.validation.browser import BrowserVerifier
+from penage.validation.browser import BrowserEvidenceValidator, BrowserVerifier
 from penage.validation.gate import ValidationGate
 from penage.validation.http import HttpEvidenceValidator
 
@@ -246,7 +246,12 @@ def build_memory(cfg: RuntimeConfig) -> MemoryStore:
     return MemoryStore(cfg.memory_db_path)
 
 
-def build_validation_gate(cfg: RuntimeConfig, llm: LLMClient) -> ValidationGate:
+def build_validation_gate(
+    cfg: RuntimeConfig,
+    llm: LLMClient,
+    *,
+    browser_validator: BrowserEvidenceValidator | None = None,
+) -> ValidationGate:
     from penage.agents.validation import ValidationAgent
 
     http_val = HttpEvidenceValidator()
@@ -255,9 +260,12 @@ def build_validation_gate(cfg: RuntimeConfig, llm: LLMClient) -> ValidationGate:
     if cfg.validation_mode == "agent":
         agent = ValidationAgent.build(llm=llm)
 
+    effective_browser_validator = browser_validator if cfg.browser_verification else None
+
     return ValidationGate(
         http_validator=http_val,
         validation_agent=agent,
+        browser_validator=effective_browser_validator,
         validation_mode=cfg.validation_mode,
     )
 

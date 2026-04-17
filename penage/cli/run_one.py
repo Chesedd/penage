@@ -152,6 +152,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable parallel specialist delegation — run them sequentially "
              "(Stage 3.7 ablation flag).",
     )
+    p.add_argument(
+        "--no-browser-verification",
+        action="store_true",
+        default=False,
+        help="Disable browser-based evidence validation in ValidationGate "
+             "(Stage 4.1 ablation flag; no-op until the Playwright adapter "
+             "lands in 4.1.b.iii).",
+    )
 
     return p.parse_args()
 

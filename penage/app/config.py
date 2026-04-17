@@ -72,6 +72,11 @@ class RuntimeConfig:
     # Ablation-compatible: set to False to fall back to the sequential path.
     parallel_specialists: bool = True
 
+    # Stage 4.1.b — browser-based evidence validation in ValidationGate.
+    # Ablation-compatible: set to False to disable the browser branch
+    # regardless of whether a browser validator was wired into the factory.
+    browser_verification: bool = True
+
 
 def _idor_cred_from_args_or_env(
     args: Namespace,
@@ -164,4 +169,5 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         correlation_stop_enabled=not bool(args.no_correlation_stop),
         validation_mode=str(args.validation_mode),
         parallel_specialists=not bool(getattr(args, "no_parallel_specialists", False)),
+        browser_verification=not bool(getattr(args, "no_browser_verification", False)),
     )
