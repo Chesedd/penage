@@ -6,7 +6,7 @@
 
 ---
 
-Current stage: 2 — AWE-style vulnerability specialists
+Current stage: 3 — Multi-agent MAPTA-style
 
 ## Этап 0 — Текущее состояние (baseline)
 
@@ -90,7 +90,7 @@ API: `MemoryStore.get(key) / set(key, value) / record_outcome(category, pattern,
 
 ## Этап 2 — Специалисты AWE по классам уязвимостей
 
-**Статус:** ⬜  
+**Статус:** ✅ 
 **Цель:** заменить обобщённого `ResearchLLMSpecialist` набором эксплуатационных специалистов с пятифазными пайплайнами AWE-стиля, добавить браузерную верификацию.  
 **Условия входа:** этап 1 закрыт.  
 
