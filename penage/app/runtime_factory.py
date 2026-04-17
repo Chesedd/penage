@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
 
+from penage.agents import SandboxAgent
 from penage.app.config import RuntimeConfig
 from penage.core.errors import LLMResponseError
 from penage.core.guard import ExecutionGuard, allowed_action_types_for_mode
@@ -132,6 +133,26 @@ def build_macro_executor() -> MacroExecutor:
     return ex
 
 
+SANDBOX_SPECIALIST_NAMES: tuple[str, ...] = (
+    "xss", "sqli", "ssti", "lfi", "xxe", "idor", "research_llm",
+)
+
+
+def build_sandbox_agents(llm: LLMClient) -> dict[str, SandboxAgent]:
+    """Build one :class:`SandboxAgent` per LLM-using specialist.
+
+    Each agent owns a :class:`RoleTaggedLLMClient` proxy wrapping ``llm``
+    — the proxy records usage under ``role="sandbox"`` and attributes
+    the call to the matching specialist bucket. The returned dict keys
+    are specialist ``name`` values; specialists receive the proxy via
+    ``sandbox_agents[name].llm_client``.
+    """
+    return {
+        n: SandboxAgent.build(inner_llm=llm, specialist_name=n)
+        for n in SANDBOX_SPECIALIST_NAMES
+    }
+
+
 def build_specialists(
     cfg: RuntimeConfig,
     llm: LLMClient,
@@ -139,41 +160,45 @@ def build_specialists(
     memory: MemoryStore | None = None,
     tools: ToolRunner | None = None,
     tracer: JsonlTracer | None = None,
+    sandbox_agents: dict[str, SandboxAgent] | None = None,
 ) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
 
     http_backend = tools.http_backend if tools is not None else None
 
+    if sandbox_agents is None:
+        sandbox_agents = build_sandbox_agents(llm)
+
     xss = XssSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["xss"].llm_client,
         memory=memory,
         browser_verifier=BrowserVerifier(),
         tracer=tracer,
     )
     sqli = SqliSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["sqli"].llm_client,
         memory=memory,
         tracer=tracer,
     )
     ssti = SstiSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["ssti"].llm_client,
         memory=memory,
         tracer=tracer,
     )
     lfi = LfiSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["lfi"].llm_client,
         memory=memory,
         tracer=tracer,
         oob_listener=None,
     )
     xxe = XxeSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["xxe"].llm_client,
         memory=memory,
         tracer=tracer,
         # shared OobListener wiring is a separate infra task; until then
@@ -182,7 +207,7 @@ def build_specialists(
     )
     idor = IdorSpecialist(
         http_tool=http_backend,
-        llm_client=llm,
+        llm_client=sandbox_agents["idor"].llm_client,
         memory=memory,
         tracer=tracer,
         role_a_password=cfg.idor_role_a_pass,
@@ -197,7 +222,7 @@ def build_specialists(
             CurlReconSpecialist(),
             NavigatorSpecialist(),
             ResearchSpecialist(),
-            ResearchLLMSpecialist(llm),
+            ResearchLLMSpecialist(sandbox_agents["research_llm"].llm_client),
             xss,
             sqli,
             ssti,
@@ -244,6 +269,7 @@ def build_orchestrator(
     tracer: JsonlTracer,
     memory: MemoryStore | None = None,
 ) -> Orchestrator:
+    sandbox_agents = build_sandbox_agents(llm)
     return Orchestrator(
         llm=llm,
         tools=tools,
@@ -251,10 +277,15 @@ def build_orchestrator(
         guard=ExecutionGuard(allowed=allowed_action_types_for_mode(cfg.mode)),
         url_guard=UrlGuard(block_static_assets=(not cfg.allow_static)),
         policy=build_policy(cfg),
-        specialists=build_specialists(cfg, llm, memory=memory, tools=tools, tracer=tracer),
+        specialists=build_specialists(
+            cfg, llm,
+            memory=memory, tools=tools, tracer=tracer,
+            sandbox_agents=sandbox_agents,
+        ),
         macro_executor=build_macro_executor(),
         memory=memory,
         validation_gate=build_validation_gate(cfg, llm),
+        sandbox_agents=sandbox_agents,
     )
 
 
