@@ -28,6 +28,7 @@ from penage.specialists.navigator import NavigatorSpecialist
 from penage.specialists.research import ResearchSpecialist
 from penage.specialists.research_llm import ResearchLLMSpecialist
 from penage.specialists.sandbox_smoke import SandboxSmokeSpecialist
+from penage.specialists.vulns.idor import IdorSpecialist
 from penage.specialists.vulns.lfi import LfiSpecialist
 from penage.specialists.vulns.sqli import SqliSpecialist
 from penage.specialists.vulns.ssti import SstiSpecialist
@@ -177,6 +178,14 @@ def build_specialists(
         # phase 4 degrades gracefully via the is_running check.
         oob_listener=None,
     )
+    idor = IdorSpecialist(
+        http_tool=http_backend,
+        llm_client=llm,
+        memory=memory,
+        tracer=tracer,
+        role_a_password=cfg.idor_role_a_pass,
+        role_b_password=cfg.idor_role_b_pass,
+    )
 
     return SpecialistManager(
         specialists=[
@@ -192,6 +201,7 @@ def build_specialists(
             ssti,
             lfi,
             xxe,
+            idor,
         ],
         llm=llm,
         memory=memory,

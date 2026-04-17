@@ -145,6 +145,11 @@ Phase 5: verification           (BrowserVerifier для XSS;
 
 Каждая фаза — отдельный метод, с отдельной точкой для trace-события. `PayloadHistory` используется для дедупа.
 
+Статус: ✅ `IdorSpecialist` реализован (6 фаз: login → discovery →
+horizontal differential → sequential enumeration → vertical privilege
+probe → candidate finalize) и провязан в `runtime_factory.build_specialists`
+с передачей role-passwords из `RuntimeConfig`.
+
 **2.5 — Дополнительные специалисты.**  
 Файлы: `lfi.py`, `xxe.py`, `ssrf.py`, `cmdinj.py`.  
 Минимум для этого этапа — скелеты + базовые probes. Полировка возможна позже отдельной итерацией.

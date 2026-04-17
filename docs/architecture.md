@@ -131,6 +131,12 @@ Examples:
   OOB blind → candidate-finalize). Detection via
   `shared/xml_utils.detect_xxe_markers`; DoS-payload safety via
   `XmlSafetyFilter`.
+- `IdorSpecialist` — 6-phase (login → discovery → horizontal differential →
+  sequential enumeration → vertical privilege probe → candidate finalize).
+  Evidence via `shared/differential.compare_responses` (body-hash equality,
+  cross-owner PII markers, status spread). Multi-role session management via
+  `shared/session_login.login_role` + `state.AuthRoleRegistry`. Purely
+  deterministic; no LLM payload mutation (same rationale as XXE).
 
 Manager and pipeline:
 
