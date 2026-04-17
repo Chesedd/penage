@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 import httpx
 
 from penage.core.actions import Action
 from penage.core.observations import Observation
+from penage.core.rate_limit import RateLimiter
 from penage.tools.http_support import build_http_observation, http_action_error, resolve_allowed_hosts
 
 
@@ -15,10 +16,21 @@ from penage.tools.http_support import build_http_observation, http_action_error,
 class HttpTool:
     client: httpx.AsyncClient
     allowed_hosts: set[str]
+    rate_limiter: RateLimiter = field(default_factory=lambda: RateLimiter(None))
 
     @classmethod
-    def create_default(cls, client: httpx.AsyncClient, allowed_hosts: Optional[Iterable[str]] = None) -> "HttpTool":
-        return cls(client=client, allowed_hosts=resolve_allowed_hosts(allowed_hosts))
+    def create_default(
+        cls,
+        client: httpx.AsyncClient,
+        allowed_hosts: Optional[Iterable[str]] = None,
+        *,
+        rate_limiter: RateLimiter | None = None,
+    ) -> "HttpTool":
+        return cls(
+            client=client,
+            allowed_hosts=resolve_allowed_hosts(allowed_hosts),
+            rate_limiter=rate_limiter if rate_limiter is not None else RateLimiter(None),
+        )
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -49,17 +61,18 @@ class HttpTool:
 
         start = time.perf_counter()
         try:
-            resp = await self.client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=qparams,
-                data=data,
-                json=json_body,
-                cookies=cookies,
-                follow_redirects=bool(follow_redirects),
-                timeout=timeout_s,
-            )
+            async with self.rate_limiter.acquire(url):
+                resp = await self.client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=qparams,
+                    data=data,
+                    json=json_body,
+                    cookies=cookies,
+                    follow_redirects=bool(follow_redirects),
+                    timeout=timeout_s,
+                )
 
             text = resp.text if resp.text is not None else ""
             elapsed_ms = int((time.perf_counter() - start) * 1000)

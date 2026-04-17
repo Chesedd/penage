@@ -8,6 +8,7 @@ from penage.app.config import RuntimeConfig
 from penage.core.errors import LLMResponseError
 from penage.core.guard import ExecutionGuard, allowed_action_types_for_mode
 from penage.core.orchestrator import Orchestrator
+from penage.core.rate_limit import RateLimiter
 from penage.core.tracer import JsonlTracer
 from penage.core.url_guard import UrlGuard
 from penage.llm.base import LLMClient
@@ -99,11 +100,17 @@ def build_sandbox(cfg: RuntimeConfig) -> Sandbox:
     return NullSandbox()
 
 
-def build_tools(cfg: RuntimeConfig, *, sandbox: Sandbox) -> ToolRunner:
+def build_tools(
+    cfg: RuntimeConfig,
+    *,
+    sandbox: Sandbox,
+    rate_limiter: RateLimiter | None = None,
+) -> ToolRunner:
     return ToolRunner.create_default(
         allowed_hosts=build_allowed_hosts(cfg),
         sandbox=sandbox,
         use_curl_http=use_curl_http_backend(cfg),
+        rate_limiter=rate_limiter,
     )
 
 
@@ -254,7 +261,11 @@ def build_memory(cfg: RuntimeConfig) -> MemoryStore:
     return MemoryStore(cfg.memory_db_path)
 
 
-def build_browser(cfg: RuntimeConfig) -> PlaywrightBrowser | None:
+def build_browser(
+    cfg: RuntimeConfig,
+    *,
+    rate_limiter: RateLimiter | None = None,
+) -> PlaywrightBrowser | None:
     """Return a :class:`PlaywrightBrowser` when browser verification is on.
 
     Returns ``None`` if ``cfg.browser_verification`` is false so the
@@ -264,7 +275,7 @@ def build_browser(cfg: RuntimeConfig) -> PlaywrightBrowser | None:
     """
     if not cfg.browser_verification:
         return None
-    return PlaywrightBrowser()
+    return PlaywrightBrowser(rate_limiter=rate_limiter)
 
 
 def build_validation_gate(
@@ -298,10 +309,11 @@ def build_orchestrator(
     tools: ToolRunner,
     tracer: JsonlTracer,
     memory: MemoryStore | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> Orchestrator:
     sandbox_agents = build_sandbox_agents(llm)
 
-    browser = build_browser(cfg)
+    browser = build_browser(cfg, rate_limiter=rate_limiter)
     browser_validator = (
         BrowserEvidenceValidator(browser) if browser is not None else None
     )
@@ -330,11 +342,14 @@ def build_orchestrator(
 
 
 def build_runtime_components(cfg: RuntimeConfig, *, tracer: JsonlTracer) -> RuntimeComponents:
+    rate_limiter = RateLimiter(cfg.max_concurrent_per_host)
     sandbox = build_sandbox(cfg)
-    tools = build_tools(cfg, sandbox=sandbox)
+    tools = build_tools(cfg, sandbox=sandbox, rate_limiter=rate_limiter)
     llm = build_llm(cfg)
     memory = build_memory(cfg)
-    orchestrator = build_orchestrator(cfg, llm=llm, tools=tools, tracer=tracer, memory=memory)
+    orchestrator = build_orchestrator(
+        cfg, llm=llm, tools=tools, tracer=tracer, memory=memory, rate_limiter=rate_limiter,
+    )
     return RuntimeComponents(
         base_url=compute_base_url(cfg),
         sandbox=sandbox,

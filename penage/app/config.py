@@ -77,6 +77,12 @@ class RuntimeConfig:
     # regardless of whether a browser validator was wired into the factory.
     browser_verification: bool = True
 
+    # Stage 4.2 — per-host concurrency cap for outbound HTTP (tools) and
+    # browser navigation. ``None`` / ``0`` disables rate limiting (zero
+    # overhead). Default 4 is safe for DVWA and typical bug-bounty scope
+    # — a lower value if a target is known to be fragile.
+    max_concurrent_per_host: int | None = 4
+
 
 def _idor_cred_from_args_or_env(
     args: Namespace,
