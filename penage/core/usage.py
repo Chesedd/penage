@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Iterator, Optional
 
 
 KNOWN_ROLES = ("specialist", "validation", "coordinator", "sandbox")
@@ -42,6 +44,7 @@ class RoleMetrics:
 @dataclass(slots=True)
 class UsageTracker:
     _roles: Dict[str, RoleMetrics] = field(default_factory=dict)
+    _specialists: Dict[str, RoleMetrics] = field(default_factory=dict)
     _episode_start: float = field(default_factory=time.perf_counter)
 
     def _get(self, role: str) -> RoleMetrics:
@@ -51,20 +54,42 @@ class UsageTracker:
             self._roles[role] = m
         return m
 
+    def _get_specialist(self, name: str) -> RoleMetrics:
+        m = self._specialists.get(name)
+        if m is None:
+            m = RoleMetrics()
+            self._specialists[name] = m
+        return m
+
     def record_llm_call(
         self,
         role: str,
         provider_name: str,
         token_usage: Dict[str, int],
         cost: float = 0.0,
+        *,
+        specialist: Optional[str] = None,
     ) -> None:
+        input_tokens = int(token_usage.get("input_tokens") or 0)
+        output_tokens = int(token_usage.get("output_tokens") or 0)
+        cached_tokens = int(token_usage.get("cached_tokens") or 0)
+        reasoning_tokens = int(token_usage.get("reasoning_tokens") or 0)
+
         m = self._get(role)
         m.llm_calls += 1
-        m.input_tokens += int(token_usage.get("input_tokens") or 0)
-        m.output_tokens += int(token_usage.get("output_tokens") or 0)
-        m.cached_tokens += int(token_usage.get("cached_tokens") or 0)
-        m.reasoning_tokens += int(token_usage.get("reasoning_tokens") or 0)
+        m.input_tokens += input_tokens
+        m.output_tokens += output_tokens
+        m.cached_tokens += cached_tokens
+        m.reasoning_tokens += reasoning_tokens
         m.dollar_cost += float(cost)
+
+        if specialist:
+            sm = self._get_specialist(specialist)
+            sm.llm_calls += 1
+            sm.input_tokens += input_tokens
+            sm.output_tokens += output_tokens
+            sm.cached_tokens += cached_tokens
+            sm.reasoning_tokens += reasoning_tokens
 
     def record_tool_call(self, role: str, duration_seconds: float) -> None:
         m = self._get(role)
@@ -115,8 +140,13 @@ class UsageTracker:
         for role in sorted(self._roles):
             by_role[role] = self._roles[role].to_dict()
 
+        by_specialist: Dict[str, object] = {}
+        for name in sorted(self._specialists):
+            by_specialist[name] = self._specialists[name].to_dict()
+
         return {
             "by_role": by_role,
+            "by_specialist": by_specialist,
             "totals": {
                 "input_tokens": self.total_input_tokens,
                 "output_tokens": self.total_output_tokens,
@@ -128,3 +158,23 @@ class UsageTracker:
                 "api_cost_usd": round(self.total_cost_usd, 6),
             },
         }
+
+
+_current_usage_tracker: ContextVar[Optional["UsageTracker"]] = ContextVar(
+    "_current_usage_tracker", default=None
+)
+
+
+def current_usage_tracker() -> Optional["UsageTracker"]:
+    """Return the tracker bound to the current task/thread, or None."""
+    return _current_usage_tracker.get()
+
+
+@contextlib.contextmanager
+def bind_usage_tracker(tracker: "UsageTracker") -> Iterator["UsageTracker"]:
+    """Bind `tracker` as the current usage tracker for the duration of the `with` block."""
+    token = _current_usage_tracker.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _current_usage_tracker.reset(token)
