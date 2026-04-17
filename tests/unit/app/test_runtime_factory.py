@@ -10,14 +10,18 @@ from penage.app.runtime_factory import (
     build_runtime_components,
     build_specialists,
     build_sandbox,
+    build_validation_gate,
     compute_base_url,
     rewrite_base_url_for_docker,
     use_curl_http_backend,
 )
 from penage.core.guard import RunMode
 from penage.core.tracer import JsonlTracer
+from penage.llm.fake import FakeLLMClient
 from penage.sandbox.docker import DockerSandbox
+from penage.sandbox.fake_browser import FakeBrowser
 from penage.sandbox.null import NullSandbox
+from penage.validation.browser import BrowserEvidenceValidator
 
 
 def _cfg(**overrides) -> RuntimeConfig:
@@ -161,3 +165,35 @@ def test_runtime_factory_does_not_log_passwords(caplog):
     all_logs = "\n".join(r.getMessage() for r in caplog.records)
     assert "SUPER_SECRET_1" not in all_logs
     assert "SUPER_SECRET_2" not in all_logs
+
+
+def test_build_validation_gate_wires_browser_validator_when_enabled():
+    cfg = _cfg()
+    assert cfg.browser_verification is True
+    llm = FakeLLMClient(fixed_text="{}")
+    browser_validator = BrowserEvidenceValidator(FakeBrowser())
+
+    gate = build_validation_gate(cfg, llm, browser_validator=browser_validator)
+
+    assert gate.browser_validator is browser_validator
+
+
+def test_build_validation_gate_ignores_browser_validator_when_disabled():
+    """Ablation-compatibility: when config disables browser verification,
+    the factory MUST ignore any browser validator it was handed."""
+    cfg = _cfg(browser_verification=False)
+    llm = FakeLLMClient(fixed_text="{}")
+    browser_validator = BrowserEvidenceValidator(FakeBrowser())
+
+    gate = build_validation_gate(cfg, llm, browser_validator=browser_validator)
+
+    assert gate.browser_validator is None
+
+
+def test_build_validation_gate_no_browser_validator_by_default():
+    cfg = _cfg()
+    llm = FakeLLMClient(fixed_text="{}")
+
+    gate = build_validation_gate(cfg, llm)
+
+    assert gate.browser_validator is None
