@@ -39,11 +39,195 @@ blind-timing detection без отдельного oracle; generic `HttpEvidence
 
 ## Section 3. Per-scenario detail
 
-<!-- filled in δ.α.2 -->
+### 3.3 Stored XSS
+
+<!-- filled in δ.α.2.c -->
+
+### 3.4 SQLi (decision: **go**)
+
+#### 3.4.1 Vulnerability class + attack mechanics
+
+DVWA target — `GET /vulnerabilities/sqli/?id=<PAYLOAD>&Submit=Submit` (auth
+`security=low`). Server side renders `SELECT first_name, last_name FROM users
+WHERE user_id='$id'` with no escaping; the `id` query parameter is the sole
+injection sink and the response includes either the matching row(s) or a raw
+MySQL error message.
+
+Three relevant payload families (no full enumeration — the live set lives in
+`penage/payloads/sqli.yaml`):
+
+* **Boolean / UNION** — `1' OR '1'='1`, `1' UNION SELECT user, password FROM
+  users-- -`. Echo additional rows in the rendered table.
+* **Error-based** — `'`, `1' AND EXTRACTVALUE(1, CONCAT(0x7e, VERSION()))-- -`.
+  Trigger MySQL syntax errors / `XPATH syntax error: '~5.7.28'` style leaks.
+* **Time-based blind** — `1' AND SLEEP(2)-- -`. Used when the response body is
+  identical for valid vs invalid `id` (not the case for low, but the
+  specialist still tries the family if error-based fingerprints fail).
+
+#### 3.4.2 `SqliSpecialist` pipeline walkthrough
+
+Three phases, sequenced inside `SqliSpecialist._run_pipeline`
+(`penage/specialists/vulns/sqli.py:217`); reshaped from canonical AWE because
+SQL parameter context is not parsed from reflection, so `context_analysis` and
+`filter_inference` collapse into the inline payload categories used by
+`PayloadMutator.mutate_by_category(...)`.
+
+* **Phase 1 — baseline timing** (`sqli.py:281`, `_measure_baseline`). Sends
+  ``baseline_samples=3`` no-injection requests (literal `value="baseline"`),
+  records `elapsed_ms`, and stores `median_s` / `max_s` / raw samples. Median
+  is the reference for phase 3's blind-timing delta. Returns `None` if fewer
+  than 2 samples succeed → pipeline aborts (`sqli.py:232`).
+* **Phase 2 — error-based probes** (`sqli.py:302`, `_run_error_phase`).
+  Mutator pulls up to `max_error_payloads=4` payloads from category
+  `error_trigger`; each is fired against the target. The response body is
+  scanned by `_fingerprint_backend` (`sqli.py:632`) for case-insensitive
+  substrings keyed on backend (`mysql`: `"you have an error in your sql
+  syntax"`, `"mysql server version"`, …; postgres / sqlite / mssql families
+  in `_BACKEND_ERROR_SIGNATURES` `sqli.py:30-60`). On a fingerprint hit, up
+  to `max_extraction_payloads=3` `error_extract` payloads run against the
+  detected backend; their bodies feed `_extract_version` (`sqli.py:643`)
+  with backend-specific regexes (`sqli.py:62-67`). A version match makes the
+  finding `verified=True` (`sqli.py:395`).
+* **Phase 3 — blind timing** (`sqli.py:415`, `_run_blind_phase`). Runs only
+  when phase 2 was unverified. Mutator pulls up to `max_blind_payloads=3`
+  payloads from `blind_timing` (backend-aware if phase 2 fingerprinted one).
+  Each payload fires `probes_per_timing_payload=3` times; samples whose
+  `elapsed_s - baseline_s >= timing_threshold_s=5.0` count as hits. ≥
+  `timing_hits_required=2` of 3 hits → `verified=True` finding
+  (`sqli.py:466`).
+
+**Finding emission.** Findings are stashed in `self._findings` during
+`propose_async` (`sqli.py:189`) and converted into a single `CandidateAction`
+by `_emit_if_any` (`sqli.py:196-215`). The action is `Action(type=NOTE,
+params={"kind": "sqli_finding", "finding": {...}}, tags=["sqli", "verified"
+| "unverified", mode])` — there is **no** dedicated `Finding` dataclass; the
+finding is the dict shaped by `_run_error_phase` (`sqli.py:401-413`) or
+`_run_blind_phase` (`sqli.py:466-484`). Score is 11.0 if verified else 5.0.
+
+#### 3.4.3 Validation oracle
+
+This is the load-bearing departure from XSS-style E2E. Three confirmed facts:
+
+1. **No dedicated SQLi validator exists.** `SqliSpecialist` is the sole
+   detection oracle: backend fingerprints (`sqli.py:30-60`), version regexes
+   (`sqli.py:62-67`), timing thresholds (`sqli.py:141`, `461`).
+2. **`ValidationGate` silently skips the SQLi NOTE.** The chosen
+   `Action(type=NOTE, …)` flows through
+   `Orchestrator._step_run → validation_gate.validate` (`orchestrator.py:307`).
+   The gate's first stage is `HttpEvidenceValidator.validate`, which short-
+   circuits at `penage/validation/http.py:278-279` (`if action.type !=
+   ActionType.HTTP: return None`). With no `browser_target` flag on the NOTE
+   action, the gate cascade returns `None` (`gate.py:115-116`) and
+   `ValidationRecorder.record` is not called — **nothing is appended to
+   `state.validation_results` for the SQLi NOTE** (`orchestrator.py:310-311`
+   guards on `vres is not None`).
+3. **There is no `level` field on a SQLi finding.** The truthy signal is
+   `finding["verified"]: bool` (set at `sqli.py:395` for error-based,
+   `sqli.py:467` for blind-timing). The CandidateAction's `tags` carry
+   `"verified"` / `"unverified"` (`sqli.py:200`), and the finding dict has
+   `"kind"` ∈ `{"sqli_error_verified", "sqli_error_fingerprint",
+   "sqli_blind_timing_verified"}` (`sqli.py:412`, `483`). `State` itself has
+   no `findings` field at all (verified via `penage/core/state/__init__.py`).
+
+**Implication for the E2E assertion.** The XSS reflected pattern
+(`positive = [r for r in state.validation_results if r["level"] in
+{"validated", "evidence"}]`, `test_dvwa_xss_reflected_low.py:80-83`) **does
+not transfer** — `state.validation_results` will be empty of SQLi-specific
+entries. The finding survives only in (a) the JSONL trace
+(`tracer.record_action(NOTE)` serialises `action.params.kind ==
+"sqli_finding"` and the full finding dict via `Action.to_dict()`,
+`tracer.py:50-58`) and (b) transiently in `CandidateAction.metadata`, which
+is not persisted post-policy.
+
+Three viable assertion shapes:
+
+* **(A) Trace-scan, verified-only** (recommended):
+  ```python
+  events = [json.loads(line) for line in trace_path.read_text().splitlines() if line]
+  sqli_actions = [
+      e for e in events
+      if e["event"] == "action"
+      and (e["payload"]["action"].get("params") or {}).get("kind") == "sqli_finding"
+  ]
+  assert any(
+      (e["payload"]["action"]["params"]["finding"] or {}).get("verified") is True
+      for e in sqli_actions
+  ), f"expected verified sqli_finding in trace; saw {sqli_actions!r}"
+  ```
+* **(B) Trace-scan, presence-only** — drop the `verified` filter; matches if
+  the specialist emitted any candidate (verified or unverified). Looser, but
+  catches `sqli_error_fingerprint` (backend identified, no extraction).
+* **(C) Tag-scan** — assert `"sqli" in action.tags and "verified" in
+  action.tags` over the same event stream. Equivalent to (A); slightly more
+  brittle if `tags` ordering changes.
+
+**Recommendation: shape (A)** for the δ.β test. Verified-only matches the
+specialist's contract (`finding["verified"]` is the documented oracle in the
+class docstring, `sqli.py:120-122`), keeps parity with how the unit tests
+assert (`test_sqli_specialist.py:99,147`), and avoids false positives from
+drive-by error pages on non-SQLi endpoints. Add a fallback note in the test:
+on assertion failure, print the trace tail so the reason is debuggable
+without re-running.
+
+#### 3.4.4 Gaps & required work (δ.β)
+
+* **`dvwa_auth.py`** — no changes; `/vulnerabilities/sqli/` works under
+  `security=low`, the current hardcoded level (`tests/support/dvwa_auth.py:118`).
+* **`build_dvwa_runtime_config`** — reuse as-is. There is **no**
+  `vuln_class` / `target_vuln_classes` knob in `RuntimeConfig`
+  (`penage/app/config.py:11-92`); `enable_specialists=True` registers all
+  vuln specialists unconditionally (`runtime_factory.py:195-247`), and
+  per-step arbitration is policy-side. The user prompt should mention SQLi
+  to bias the planner toward `/vulnerabilities/sqli/` discovery; this is
+  prompt-shaping, not config.
+* **New file** — `tests/integration/e2e/test_dvwa_sqli_low.py`. Layout
+  mirrors `test_dvwa_xss_reflected_low.py`; assertion uses shape (A).
+* **No** changes to `SqliSpecialist`, `ValidationGate`,
+  `HttpEvidenceValidator`, payload library, or memory store.
+* **Optional baseline test** (`test_dvwa_sqli_no_vuln_baseline.py`) —
+  **deferred**. Rationale: SQLi specialist's `_discover_targets` already
+  bails out fast on targets with no `id`-like query parameter (returns
+  empty list at `sqli.py:533`), so the negative case is structurally
+  blocked rather than oracle-blocked. Coverage win is small relative to
+  session scope.
+
+#### 3.4.5 Proposed test skeleton
+
+Pseudo-Python (real names verified against `test_dvwa_xss_reflected_low.py`):
+
+```python
+async def test_sqli_low_yields_verified_sqli_finding(dvwa_session, tmp_path):
+    target_url = f"{dvwa_session.base_url}/vulnerabilities/sqli/?id=1&Submit=Submit"
+    cfg = build_dvwa_runtime_config(dvwa_session.base_url, tmp_path / "trace.jsonl",
+        target_url=target_url, allowed_host=urlparse(dvwa_session.base_url).hostname,
+        experiment_tag="e2e_dvwa_sqli_low")
+    bundle = build_runtime(cfg, JsonlTracer(cfg.trace_path, episode_id="e2e-sqli-low"))
+    _inject_cookies(bundle, dvwa_session.cookies, host)
+    state, _ = await bundle.orchestrator.run_episode(user_prompt=..., state=State(...), ...)
+    events = [json.loads(l) for l in cfg.trace_path.read_text().splitlines() if l]
+    assert any(e["event"] == "action"
+        and (e["payload"]["action"].get("params") or {}).get("kind") == "sqli_finding"
+        and (e["payload"]["action"]["params"]["finding"] or {}).get("verified") is True
+        for e in events), "expected verified sqli_finding in trace"
+```
+
+#### 3.4.6 Decision rationale
+
+**Go.** Specialist exists and is unit-tested; DVWA target has zero auxiliary
+setup; gap is purely test-side. **Risk callouts:** (1) first E2E whose
+oracle bypasses `ValidationGate` — assertion shape diverges from the XSS
+reference; (2) `SqliSpecialist` has never been exercised end-to-end against
+DVWA, so flake on payload selection (LLM-mediated `PayloadMutator`) is
+plausible — budget retries / `max_steps` accordingly in δ.β.
+
+### 3.5 XSS medium
+
+<!-- filled in δ.α.2.b -->
 
 ## Section 4. Integrated plan for δ.β
 
-<!-- filled in δ.α.2 -->
+<!-- filled in δ.α.2.c -->
+
 
 ## Section 5. Open questions
 
