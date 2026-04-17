@@ -36,8 +36,10 @@ from penage.specialists.vulns.sqli import SqliSpecialist
 from penage.specialists.vulns.ssti import SstiSpecialist
 from penage.specialists.vulns.xss import XssSpecialist
 from penage.specialists.vulns.xxe import XxeSpecialist
+from penage.core.state_updates import StateUpdater
+from penage.core.validation_recorder import ValidationRecorder
 from penage.tools.runner import ToolRunner
-from penage.validation.browser import BrowserEvidenceValidator, BrowserVerifier
+from penage.validation.browser import BrowserEvidenceValidator
 from penage.validation.gate import ValidationGate
 from penage.validation.http import HttpEvidenceValidator
 
@@ -162,6 +164,8 @@ def build_specialists(
     tools: ToolRunner | None = None,
     tracer: JsonlTracer | None = None,
     sandbox_agents: dict[str, SandboxAgent] | None = None,
+    validation_gate: ValidationGate | None = None,
+    validation_recorder: ValidationRecorder | None = None,
 ) -> SpecialistManager | None:
     if not cfg.enable_specialists:
         return None
@@ -175,8 +179,9 @@ def build_specialists(
         http_tool=http_backend,
         llm_client=sandbox_agents["xss"].llm_client,
         memory=memory,
-        browser_verifier=BrowserVerifier(),
         tracer=tracer,
+        validation_gate=validation_gate,
+        validation_recorder=validation_recorder,
     )
     sqli = SqliSpecialist(
         http_tool=http_backend,
@@ -298,6 +303,14 @@ def build_orchestrator(
     browser_validator = (
         BrowserEvidenceValidator(browser) if browser is not None else None
     )
+    validation_gate = build_validation_gate(
+        cfg, llm, browser_validator=browser_validator,
+    )
+
+    # Share a single StateUpdater between the orchestrator and the XSS
+    # specialist so its gate-path probes write to the same trace/state
+    # channel as coordinator-issued actions (invariant #5).
+    state_updater = StateUpdater(tracer=tracer)
 
     return Orchestrator(
         llm=llm,
@@ -310,12 +323,13 @@ def build_orchestrator(
             cfg, llm,
             memory=memory, tools=tools, tracer=tracer,
             sandbox_agents=sandbox_agents,
+            validation_gate=validation_gate,
+            validation_recorder=state_updater.validation_recorder,
         ),
         macro_executor=build_macro_executor(),
         memory=memory,
-        validation_gate=build_validation_gate(
-            cfg, llm, browser_validator=browser_validator,
-        ),
+        validation_gate=validation_gate,
+        state_updater=state_updater,
         sandbox_agents=sandbox_agents,
         browser=browser,
     )

@@ -12,6 +12,8 @@ from penage.core.candidates import CandidateAction
 from penage.core.observations import Observation
 from penage.core.state import FilterModel, State
 from penage.core.tracer import JsonlTracer
+from penage.core.usage import UsageTracker, current_usage_tracker
+from penage.core.validation_recorder import ValidationRecorder
 from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
@@ -24,7 +26,8 @@ from penage.specialists.shared import (
     ReflectionResult,
 )
 from penage.tools.http_backend import HttpBackend
-from penage.validation.browser import BrowserEvidence, BrowserVerifier
+from penage.validation.base import ValidationResult
+from penage.validation.gate import ValidationGate
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +87,14 @@ class XssSpecialist(AsyncSpecialist):
         2. Context analysis — extract ReflectionContext per reflected canary.
         3. Filter/security inference (FilterInferrer -> FilterModel).
         4. Payload mutation (PayloadMutator, deterministic YAML + LLM).
-        5. Browser verification (BrowserVerifier). If Playwright is
-           unavailable, falls back to HTTP-response reflection heuristic
-           and emits an ``unverified_reflection`` evidence record.
+        5. Evidence-gated verification. The probe action is marked with
+           ``browser_target=True`` and routed through the shared
+           :class:`ValidationGate`; the gate's browser cascade produces the
+           canonical :class:`ValidationResult` (``"validated"`` for
+           execution-proof, ``"evidence"`` for DOM reflection only).
+           When no gate/recorder is wired (ablation), the specialist still
+           emits an ``xss_unverified_reflection`` finding based on HTTP
+           reflection so downstream components see the reflection signal.
 
     The specialist short-circuits once a verified finding is produced for the
     episode; it respects a local HTTP cap that also increments the episode's
@@ -98,8 +106,9 @@ class XssSpecialist(AsyncSpecialist):
     http_tool: HttpBackend | None = None
     llm_client: LLMClient | None = None
     memory: MemoryStore | None = None
-    browser_verifier: BrowserVerifier | None = None
     tracer: JsonlTracer | None = None
+    validation_gate: ValidationGate | None = None
+    validation_recorder: ValidationRecorder | None = None
 
     payload_library_path: Path = field(default_factory=lambda: _DEFAULT_LIBRARY)
     max_http_budget: int = 30
@@ -321,7 +330,11 @@ class XssSpecialist(AsyncSpecialist):
                 continue
 
             probe_url, action_params = _build_probe_action_params(target.url, target.parameter, payload, channel)
-            probe = Action(type=ActionType.HTTP, params=action_params, timeout_s=10.0, tags=["xss", "probe"])
+            probe_params = dict(action_params)
+            probe_params["browser_target"] = True
+            probe_params["browser_payload"] = payload
+            probe_params.setdefault("url", probe_url)
+            probe = Action(type=ActionType.HTTP, params=probe_params, timeout_s=10.0, tags=["xss", "probe"])
             obs = await http_tool.run(probe)
 
             response_text = ""
@@ -330,8 +343,10 @@ class XssSpecialist(AsyncSpecialist):
                 response_text = str(obs.data.get("text_full") or obs.data.get("text_excerpt") or "")
                 status = obs.data.get("status_code")
 
-            reflected = payload in response_text
-            outcome = "no_reflection"
+            reflected_http = payload in response_text
+
+            vres = await self._run_gate(state=state, probe=probe, obs=obs, step=step)
+
             evidence: dict[str, Any] = {
                 "url": probe_url,
                 "status": status,
@@ -341,27 +356,31 @@ class XssSpecialist(AsyncSpecialist):
             }
 
             verified = False
-            screenshot_path: str | None = None
+            outcome = "no_reflection"
 
-            if reflected:
+            if vres is not None:
+                evidence["browser"] = dict(vres.evidence)
+                evidence["validation_level"] = vres.level
+                evidence["validation_kind"] = vres.kind
+                if vres.level == "validated":
+                    verified = True
+                    outcome = "verified"
+                else:
+                    outcome = "reflected"
+            elif reflected_http:
+                # Ablation path or gate not wired: no browser validator fired
+                # but the payload is reflected in the HTTP response, so we
+                # still surface an evidence-level reflection finding.
                 outcome = "reflected"
-                browser_evidence = self._run_browser_verification(probe_url, payload)
-                if browser_evidence is not None and browser_evidence.available:
-                    evidence["browser"] = {
-                        "script_executed": browser_evidence.script_executed,
-                        "dialog_triggered": browser_evidence.dialog_triggered,
-                        "dom_mutations": list(browser_evidence.dom_mutations),
-                        "console_messages": list(browser_evidence.console_messages),
-                    }
-                    if browser_evidence.screenshot_path is not None:
-                        screenshot_path = str(browser_evidence.screenshot_path)
-                    if browser_evidence.script_executed:
-                        verified = True
-                        outcome = "verified"
-                elif browser_evidence is not None:
-                    evidence["browser"] = {"available": False}
+                evidence["browser"] = {"available": False}
 
-            self._record_attempt(episode_id=episode_id, host=host, parameter=target.parameter, payload=payload, outcome=outcome)
+            self._record_attempt(
+                episode_id=episode_id,
+                host=host,
+                parameter=target.parameter,
+                payload=payload,
+                outcome=outcome,
+            )
 
             if verified:
                 finding = {
@@ -373,13 +392,14 @@ class XssSpecialist(AsyncSpecialist):
                     "url": probe_url,
                     "context": context.context_type.value,
                     "evidence": evidence,
-                    "screenshot_path": screenshot_path,
+                    "screenshot_path": None,
                     "summary": f"Browser-verified XSS on {target.parameter} via {channel}",
                 }
                 self._note(f"xss:verified parameter={target.parameter}")
                 return finding
 
-            if reflected and unverified is None:
+            reflected_any = (vres is not None) or reflected_http
+            if reflected_any and unverified is None:
                 unverified = {
                     "verified": False,
                     "kind": "xss_unverified_reflection",
@@ -389,7 +409,7 @@ class XssSpecialist(AsyncSpecialist):
                     "url": probe_url,
                     "context": context.context_type.value,
                     "evidence": evidence,
-                    "screenshot_path": screenshot_path,
+                    "screenshot_path": None,
                     "summary": (
                         f"Payload reflected on {target.parameter} but browser verification "
                         f"unavailable/failed"
@@ -400,14 +420,40 @@ class XssSpecialist(AsyncSpecialist):
         _ = step
         return unverified
 
-    def _run_browser_verification(self, url: str, payload: str) -> BrowserEvidence | None:
-        if self.browser_verifier is None:
+    async def _run_gate(
+        self,
+        *,
+        state: State,
+        probe: Action,
+        obs: Observation,
+        step: int,
+    ) -> ValidationResult | None:
+        """Run the probe action through the shared validation gate.
+
+        Returns the :class:`ValidationResult` (or ``None`` if the gate has
+        no opinion on the action). When a recorder is also wired, the
+        result is persisted to trace and ``state.last_validation`` via the
+        standard :class:`ValidationRecorder` path — the same one the
+        orchestrator uses for coordinator-issued actions. Errors from the
+        gate degrade silently: the specialist falls back to the HTTP
+        reflection heuristic and emits an unverified finding.
+        """
+        if self.validation_gate is None:
             return None
+        tracker = current_usage_tracker() or UsageTracker()
         try:
-            return self.browser_verifier.verify(url, payload, expectation="alert")
-        except Exception as exc:  # LEGACY: browser is external
-            logger.warning("browser verification failed: %s", exc)
-            return BrowserEvidence.unavailable()
+            result = await self.validation_gate.validate(
+                action=probe, obs=obs, state=state, tracker=tracker,
+            )
+        except Exception as exc:  # LEGACY: browser/LLM boundary must not crash
+            logger.warning("xss validation gate failed: %s", exc)
+            return None
+        if result is not None and self.validation_recorder is not None:
+            try:
+                self.validation_recorder.record(state, probe, result, step=step)
+            except Exception as exc:  # LEGACY: tracer boundary
+                logger.warning("xss validation recorder failed: %s", exc)
+        return result
 
     def _discover_targets(self, state: State) -> list[_XssTarget]:
         targets: list[_XssTarget] = []
