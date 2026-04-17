@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from penage.core.rate_limit import RateLimiter
 from penage.sandbox.browser_base import BrowserError
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,12 @@ class PlaywrightBrowser:
         headless: bool = True,
         navigate_wait_until: str = _DEFAULT_WAIT_UNTIL,
         navigate_timeout_ms: int = _DEFAULT_NAVIGATE_TIMEOUT_MS,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self._headless: bool = bool(headless)
         self._wait_until: str = str(navigate_wait_until)
         self._timeout_ms: int = int(navigate_timeout_ms)
+        self._rate_limiter: RateLimiter = rate_limiter if rate_limiter is not None else RateLimiter(None)
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -118,11 +121,12 @@ class PlaywrightBrowser:
     async def navigate(self, url: str) -> None:
         await self._ensure()
         try:
-            await self._page.goto(
-                url,
-                wait_until=self._wait_until,
-                timeout=self._timeout_ms,
-            )
+            async with self._rate_limiter.acquire(url):
+                await self._page.goto(
+                    url,
+                    wait_until=self._wait_until,
+                    timeout=self._timeout_ms,
+                )
         except BrowserError:
             raise
         except Exception as exc:

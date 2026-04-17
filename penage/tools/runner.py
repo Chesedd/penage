@@ -7,6 +7,7 @@ import httpx
 
 from penage.core.actions import Action, ActionType
 from penage.core.observations import Observation
+from penage.core.rate_limit import RateLimiter
 from penage.sandbox.base import Sandbox
 from penage.sandbox.null import NullSandbox
 from penage.tools.curl_http_tool import CurlHttpTool
@@ -39,6 +40,7 @@ class ToolRunner:
         http_client: Optional[httpx.AsyncClient] = None,
         sandbox: Optional[Sandbox] = None,
         use_curl_http: bool = False,
+        rate_limiter: RateLimiter | None = None,
     ) -> "ToolRunner":
         client = http_client or httpx.AsyncClient()
         sb = sandbox or NullSandbox()
@@ -48,7 +50,9 @@ class ToolRunner:
         if use_curl_http:
             http_backend = CurlHttpTool.create_default(sb, allowed_hosts=allowed_hosts)
         else:
-            http_backend = HttpTool.create_default(client, allowed_hosts=allowed_hosts)
+            http_backend = HttpTool.create_default(
+                client, allowed_hosts=allowed_hosts, rate_limiter=rate_limiter,
+            )
 
         return cls(http_backend=http_backend, sandbox_tool=sandbox_tool)
 
