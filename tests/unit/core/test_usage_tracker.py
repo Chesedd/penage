@@ -184,3 +184,67 @@ def test_token_usage_missing_keys_default_to_zero():
     assert m.cached_tokens == 0
     assert m.reasoning_tokens == 0
     assert m.llm_calls == 1
+
+
+def test_record_llm_call_with_specialist_writes_both_maps():
+    t = UsageTracker()
+    t.record_llm_call(
+        "sandbox",
+        "fake",
+        {"input_tokens": 10, "output_tokens": 5, "cached_tokens": 2, "reasoning_tokens": 1},
+        cost=0.01,
+        specialist="xss",
+    )
+
+    role_m = t._roles["sandbox"]
+    spec_m = t._specialists["xss"]
+
+    assert role_m.llm_calls == 1
+    assert role_m.input_tokens == 10
+    assert role_m.output_tokens == 5
+    assert role_m.cached_tokens == 2
+    assert role_m.reasoning_tokens == 1
+    assert abs(role_m.dollar_cost - 0.01) < 1e-9
+
+    assert spec_m.llm_calls == 1
+    assert spec_m.input_tokens == 10
+    assert spec_m.output_tokens == 5
+    assert spec_m.cached_tokens == 2
+    assert spec_m.reasoning_tokens == 1
+    # cost is not duplicated to specialist bucket
+    assert spec_m.dollar_cost == 0.0
+
+    # totals read from by_role only — no double counting
+    d = t.to_dict()
+    assert d["totals"]["input_tokens"] == 10
+    assert d["totals"]["output_tokens"] == 5
+    assert d["totals"]["llm_calls"] == 1
+    assert d["totals"]["api_cost_usd"] == 0.01
+
+    assert "by_specialist" in d
+    assert "xss" in d["by_specialist"]
+    assert d["by_specialist"]["xss"]["llm_calls"] == 1
+
+
+def test_record_llm_call_without_specialist_leaves_map_empty():
+    t = UsageTracker()
+    t.record_llm_call("sandbox", "fake", {"input_tokens": 7, "output_tokens": 3})
+
+    assert t._specialists == {}
+    d = t.to_dict()
+    assert d["by_specialist"] == {}
+
+
+def test_record_llm_call_empty_specialist_string_is_ignored():
+    t = UsageTracker()
+    t.record_llm_call("sandbox", "fake", {"input_tokens": 1}, specialist="")
+
+    assert t._specialists == {}
+    assert t.to_dict()["by_specialist"] == {}
+
+
+def test_to_dict_always_contains_by_specialist_key():
+    t = UsageTracker()
+    d = t.to_dict()
+    assert "by_specialist" in d
+    assert d["by_specialist"] == {}
