@@ -127,6 +127,10 @@ Examples:
 - `LfiSpecialist` — 5-phase (discovery → deterministic → bypass+mutation →
   OOB(php_filter+file_url) → candidate-finalize). Markers via
   `shared/path_traversal.detect_lfi_markers`.
+- `XxeSpecialist` — 5-phase (discovery → classic SYSTEM → parameter-entity →
+  OOB blind → candidate-finalize). Detection via
+  `shared/xml_utils.detect_xxe_markers`; DoS-payload safety via
+  `XmlSafetyFilter`.
 
 Manager and pipeline:
 

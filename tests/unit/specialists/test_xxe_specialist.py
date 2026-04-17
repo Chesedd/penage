@@ -183,10 +183,261 @@ def test_target_discovery_max_targets_respected():
     assert len(targets) == 2
 
 
-def test_phase_5_not_implemented_raises():
+def _target(url: str = "http://localhost/api/xml") -> _XxeTarget:
+    return _XxeTarget(
+        url=url,
+        delivery="body",
+        parameter="",
+        channel="POST",
+        content_type="application/xml",
+    )
+
+
+def test_phase_5_xml_parse_error_produces_parser_reachable_candidate():
     specialist = XxeSpecialist(http_tool=None, max_http_budget=25)
-    with pytest.raises(NotImplementedError):
-        specialist._finalize_candidate()
+    target = _target()
+    observations = [
+        {
+            "payload_id": "xxe-classic-passwd",
+            "status": 200,
+            "body_excerpt": "xmlParseEntityRef: no name",
+            "xml_parse_error": True,
+            "hits": ["xml_parse_error"],
+        }
+    ]
+    candidate = specialist._finalize_candidate(
+        target=target, channel=target.channel, observations=observations,
+    )
+    assert candidate is not None
+    assert candidate["verified"] is False
+    assert candidate["kind"] == "xxe_parser_reachable"
+    assert candidate["mode"] == "candidate"
+    assert candidate["family"] == "xml_parse_error"
+    assert candidate["payload_id"] == "xxe-classic-passwd"
+    assert candidate["evidence"]["xml_parse_error"] is True
+    assert candidate["evidence"]["http_status"] == 200
+    assert "parser reachable" in candidate["summary"].lower()
+
+
+def test_phase_5_status_differential_produces_candidate():
+    specialist = XxeSpecialist(http_tool=None, max_http_budget=25)
+    target = _target()
+    observations = [
+        {
+            "payload_id": "xxe-a",
+            "status": 200,
+            "body_excerpt": "<ok/>",
+            "xml_parse_error": False,
+            "hits": [],
+        },
+        {
+            "payload_id": "xxe-b",
+            "status": 500,
+            "body_excerpt": "internal server error",
+            "xml_parse_error": False,
+            "hits": [],
+        },
+    ]
+    candidate = specialist._finalize_candidate(
+        target=target, channel=target.channel, observations=observations,
+    )
+    assert candidate is not None
+    assert candidate["verified"] is False
+    assert candidate["kind"] == "xxe_status_differential"
+    assert candidate["mode"] == "candidate"
+    assert candidate["payload_id"] == "xxe-b"
+    assert 200 in candidate["evidence"]["status_spread"]
+    assert 500 in candidate["evidence"]["status_spread"]
+
+
+def test_phase_5_no_observations_returns_none():
+    specialist = XxeSpecialist(http_tool=None, max_http_budget=25)
+    target = _target()
+    assert (
+        specialist._finalize_candidate(
+            target=target, channel=target.channel, observations=[],
+        )
+        is None
+    )
+
+
+def test_phase_5_all_4xx_returns_none():
+    specialist = XxeSpecialist(http_tool=None, max_http_budget=25)
+    target = _target()
+    observations = [
+        {
+            "payload_id": "xxe-a",
+            "status": 400,
+            "body_excerpt": "bad request",
+            "xml_parse_error": False,
+            "hits": [],
+        },
+        {
+            "payload_id": "xxe-b",
+            "status": 403,
+            "body_excerpt": "forbidden",
+            "xml_parse_error": False,
+            "hits": [],
+        },
+    ]
+    assert (
+        specialist._finalize_candidate(
+            target=target, channel=target.channel, observations=observations,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_emitted_with_score_3_for_parser_reachable():
+    # Response body carries an xml_parse_error marker string, but no strong
+    # disclosure marker. Phases 2-4 produce no verified finding, so phase 5
+    # finalizes a parser-reachable candidate.
+    http = ScriptedHttp(
+        body_for=lambda a: "XML parsing error: premature end of data",
+        status_for=lambda a: 200,
+    )
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+    _prime_cache(
+        specialist,
+        [
+            {
+                "id": "xxe-classic-passwd",
+                "category": "classic-unix",
+                "template": "classic",
+                "uri": "file:///etc/passwd",
+                "entity_name": "xxe",
+                "content_type": "application/xml",
+                "payload": "",
+            }
+        ],
+    )
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    candidate = out[0]
+    assert candidate.score == 3.0
+    finding = candidate.metadata["evidence"]
+    assert finding["verified"] is False
+    assert finding["kind"] == "xxe_parser_reachable"
+
+
+@pytest.mark.asyncio
+async def test_candidate_emitted_with_score_2_for_status_differential():
+    calls = {"n": 0}
+
+    def status_for(action: Action) -> int:
+        calls["n"] += 1
+        return 200 if calls["n"] == 1 else 500
+
+    http = ScriptedHttp(
+        body_for=lambda a: "<response>ok</response>",
+        status_for=status_for,
+    )
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+    _prime_cache(
+        specialist,
+        [
+            {
+                "id": "xxe-a",
+                "category": "classic-unix",
+                "template": "classic",
+                "uri": "file:///etc/passwd",
+                "entity_name": "xxe",
+                "content_type": "application/xml",
+                "payload": "",
+            },
+            {
+                "id": "xxe-b",
+                "category": "classic-unix",
+                "template": "classic",
+                "uri": "file:///etc/hosts",
+                "entity_name": "xxe",
+                "content_type": "application/xml",
+                "payload": "",
+            },
+        ],
+    )
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    candidate = out[0]
+    assert candidate.score == 2.0
+    finding = candidate.metadata["evidence"]
+    assert finding["verified"] is False
+    assert finding["kind"] == "xxe_status_differential"
+
+
+@pytest.mark.asyncio
+async def test_verified_takes_precedence_over_candidate_emit():
+    # First probe verifies (passwd body). Phase 5 must not overwrite the
+    # verified finding, and the emitter must ship a score=12.0 CandidateAction.
+    http = ScriptedHttp(body_for=lambda a: _PASSWD_LINE)
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+    _prime_cache(
+        specialist,
+        [
+            {
+                "id": "xxe-classic-passwd",
+                "category": "classic-unix",
+                "template": "classic",
+                "uri": "file:///etc/passwd",
+                "entity_name": "xxe",
+                "content_type": "application/xml",
+                "payload": "",
+            }
+        ],
+    )
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    candidate = out[0]
+    assert candidate.score == 12.0
+    finding = candidate.metadata["evidence"]
+    assert finding["verified"] is True
+    # No unverified candidate was stashed.
+    assert all(f.get("verified") for f in specialist._findings)
+
+
+def test_runtime_factory_wires_xxe():
+    from pathlib import Path as _Path
+
+    from penage.app.config import RuntimeConfig
+    from penage.app.runtime_factory import build_specialists
+    from penage.core.guard import RunMode
+
+    class _FakeLLM:
+        provider_name = "fake"
+
+    cfg = RuntimeConfig(
+        base_url="http://localhost:8080",
+        llm_provider="ollama",
+        llm_model="llama3.1",
+        ollama_model="llama3.1",
+        ollama_url="http://localhost:11434",
+        trace_path=_Path("trace.jsonl"),
+        summary_path=None,
+        mode=RunMode.SAFE_HTTP,
+        allow_static=False,
+        actions_per_step=1,
+        max_steps=5,
+        max_http_requests=10,
+        max_total_text_len=1000,
+        enable_specialists=True,
+        policy_enabled=False,
+        sandbox_backend="null",
+        docker_image="python:3.12-slim",
+        docker_network="none",
+        experiment_tag="",
+        allowed_hosts=(),
+    )
+
+    manager = build_specialists(
+        cfg, _FakeLLM(), memory=None, tools=None, tracer=None
+    )
+    assert manager is not None
+    assert any(isinstance(s, XxeSpecialist) for s in manager.specialists)
+    assert any(getattr(s, "name", "") == "xxe" for s in manager.specialists)
 
 
 @pytest.mark.asyncio
