@@ -124,6 +124,9 @@ Examples:
   Emits `cmdinj_echo` / `cmdinj_blind` verified findings, or
   `cmdinj_reflected_no_exec` / `cmdinj_timing_noise` / `cmdinj_blocked`
   candidates when only partial signals remain.
+- `LfiSpecialist` — 5-phase (discovery → deterministic → bypass+mutation →
+  OOB(php_filter+file_url) → candidate-finalize). Markers via
+  `shared/path_traversal.detect_lfi_markers`.
 
 Manager and pipeline:
 
