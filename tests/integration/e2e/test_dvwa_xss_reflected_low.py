@@ -14,43 +14,14 @@ from urllib.parse import urlparse
 import pytest
 
 from penage.app.bootstrap import build_runtime
-from penage.app.config import RuntimeConfig
-from penage.core.guard import RunMode
 from penage.core.state import State
 from penage.core.tracer import JsonlTracer
 
 from tests.support.dvwa_auth import DvwaSession
+from tests.support.e2e_config import build_dvwa_runtime_config
 
 
 pytestmark = pytest.mark.e2e_dvwa
-
-
-def _build_cfg(base_url: str, trace_path: Path, *, target_url: str) -> RuntimeConfig:
-    host = urlparse(base_url).hostname or "127.0.0.1"
-    return RuntimeConfig(
-        base_url=target_url,
-        llm_provider="ollama",
-        llm_model="llama3.1",
-        ollama_model="llama3.1",
-        ollama_url="http://localhost:11434",
-        trace_path=trace_path,
-        summary_path=None,
-        mode=RunMode.SAFE_HTTP,
-        allow_static=False,
-        actions_per_step=1,
-        max_steps=12,
-        max_http_requests=60,
-        max_total_text_len=400_000,
-        enable_specialists=True,
-        policy_enabled=True,
-        sandbox_backend="null",
-        docker_image="python:3.12-slim",
-        docker_network="none",
-        experiment_tag="e2e_dvwa_xss_reflected_low",
-        allowed_hosts=(host,),
-        browser_verification=True,
-        browser_launch_args=("--no-sandbox", "--disable-dev-shm-usage"),
-    )
 
 
 def _inject_cookies(bundle, cookies: dict[str, str], host: str) -> None:
@@ -71,12 +42,21 @@ async def test_xss_reflected_low_yields_validated_or_evidence(
 ) -> None:
     target_url = f"{dvwa_session.base_url}/vulnerabilities/xss_r/?name=probe"
     trace_path = tmp_path / "trace.jsonl"
-    cfg = _build_cfg(dvwa_session.base_url, trace_path, target_url=target_url)
+    host = urlparse(dvwa_session.base_url).hostname or "127.0.0.1"
+    cfg = build_dvwa_runtime_config(
+        dvwa_session.base_url,
+        trace_path,
+        target_url=target_url,
+        allowed_host=host,
+        experiment_tag="e2e_dvwa_xss_reflected_low",
+        max_steps=12,
+        max_http_requests=60,
+        max_total_text_len=400_000,
+    )
 
     tracer = JsonlTracer(trace_path, episode_id="e2e-xss-reflected-low")
     bundle = build_runtime(cfg, tracer)
 
-    host = urlparse(dvwa_session.base_url).hostname or "127.0.0.1"
     _inject_cookies(bundle, dvwa_session.cookies, host)
 
     try:

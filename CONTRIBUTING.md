@@ -90,6 +90,30 @@ In rootful Docker / Linux CI, set
 `RuntimeConfig.browser_launch_args=("--no-sandbox", "--disable-dev-shm-usage")`
 (the E2E fixture already does) so chromium's own sandbox is disabled.
 
+#### Required environment for E2E
+
+E2E tests hit a real DVWA container and exercise the agent end-to-end,
+so they need a working LLM and a Docker sandbox:
+
+1. **LLM credentials** — set either `OPENAI_API_KEY` or
+   `ANTHROPIC_API_KEY`. Auto-detection prefers OpenAI; override
+   explicitly via `PENAGE_E2E_LLM_PROVIDER`
+   (`openai` / `anthropic` / `ollama`) and `PENAGE_E2E_LLM_MODEL`.
+   Default models come from `penage/llm/<provider>.py::DEFAULT_MODEL`.
+2. **Docker Desktop** running — required for the sandbox backend
+   (shell-based recon). Set `PENAGE_E2E_SANDBOX_BACKEND=null` to fall
+   back to the null sandbox (note: some recon actions won't run).
+3. Bring DVWA up, run pytest, tear down:
+
+   ```bash
+   docker compose -f compose/e2e_dvwa.yml up -d
+   pytest -m e2e_dvwa tests/integration/e2e/ -o addopts= -v
+   docker compose -f compose/e2e_dvwa.yml down -v
+   ```
+
+Tests skip cleanly (not fail) when LLM credentials or the Docker
+daemon are unavailable.
+
 ## Security note
 
 This repository should be used only for authorized targets.
