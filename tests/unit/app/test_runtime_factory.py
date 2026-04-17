@@ -5,6 +5,7 @@ from pathlib import Path
 from penage.app.config import RuntimeConfig
 from penage.app.runtime_factory import (
     build_allowed_hosts,
+    build_browser,
     build_macro_executor,
     build_policy,
     build_runtime_components,
@@ -21,6 +22,7 @@ from penage.llm.fake import FakeLLMClient
 from penage.sandbox.docker import DockerSandbox
 from penage.sandbox.fake_browser import FakeBrowser
 from penage.sandbox.null import NullSandbox
+from penage.sandbox.playwright_browser import PlaywrightBrowser
 from penage.validation.browser import BrowserEvidenceValidator
 
 
@@ -197,3 +199,42 @@ def test_build_validation_gate_no_browser_validator_by_default():
     gate = build_validation_gate(cfg, llm)
 
     assert gate.browser_validator is None
+
+
+def test_build_browser_returns_none_when_verification_disabled():
+    assert build_browser(_cfg(browser_verification=False)) is None
+
+
+def test_build_browser_returns_playwright_instance_when_enabled():
+    import asyncio
+
+    browser = build_browser(_cfg(browser_verification=True))
+    try:
+        assert isinstance(browser, PlaywrightBrowser)
+    finally:
+        asyncio.run(browser.aclose())
+
+
+def test_build_orchestrator_wires_browser_into_validation_gate(tmp_path):
+    import asyncio
+
+    cfg = _cfg(browser_verification=True)
+    tracer = JsonlTracer(tmp_path / "trace.jsonl", episode_id="test")
+
+    components = build_runtime_components(cfg, tracer=tracer)
+    try:
+        assert components.orchestrator.browser is not None
+        assert isinstance(components.orchestrator.browser, PlaywrightBrowser)
+        assert components.orchestrator.validation_gate.browser_validator is not None
+    finally:
+        asyncio.run(components.orchestrator.browser.aclose())
+
+
+def test_build_orchestrator_no_browser_when_disabled(tmp_path):
+    cfg = _cfg(browser_verification=False)
+    tracer = JsonlTracer(tmp_path / "trace.jsonl", episode_id="test")
+
+    components = build_runtime_components(cfg, tracer=tracer)
+
+    assert components.orchestrator.browser is None
+    assert components.orchestrator.validation_gate.browser_validator is None
