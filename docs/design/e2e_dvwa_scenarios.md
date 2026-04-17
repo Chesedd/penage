@@ -39,9 +39,58 @@ blind-timing detection без отдельного oracle; generic `HttpEvidence
 
 ## Section 3. Per-scenario detail
 
-### 3.3 Stored XSS
+### 3.3 Stored XSS (decision: **blocked**)
 
-<!-- filled in δ.α.2.c -->
+#### 3.3.1 Vulnerability class + attack mechanics
+
+DVWA target — `POST /vulnerabilities/xss_s/` with form fields `txtName`,
+`mtxMessage`, `btnSign=Sign Guestbook` (auth `security=low`). The `mtxMessage`
+value is persisted in the guestbook DB table unsanitised. A subsequent
+`GET /vulnerabilities/xss_s/` renders the table, including any previously
+injected markup, back into the response body. The critical distinction from
+reflected XSS is that **inject and trigger are two separate HTTP requests**
+against the same URL but with different methods (POST vs GET), and the
+trigger observation is not causally tied to the inject request's response.
+
+#### 3.3.2 Why blocked (architectural gap)
+
+* `BrowserEvidenceValidator.validate(...)` issues a single
+  `await self._browser.navigate(url)` (`penage/validation/browser.py:143`).
+  There is no hook to send an inject-request first and navigate to a
+  different trigger-URL afterwards, nor any state-machine for
+  "POST → GET → observe".
+* `XssSpecialist` phase 4 (payload delivery) and phase 5 (browser
+  verification) treat `target_url` as singular (`penage/specialists/vulns/xss.py:380-388`:
+  `browser_probe.params["url"] = probe_url`, the same URL used to deliver the
+  payload). There is no split between an inject-endpoint and a render-page.
+* Stored XSS is therefore not reducible to "the same reflected-XSS pipeline
+  with a different URL"; the specialist's pipeline needs a semantic
+  extension (two-step inject/trigger), not a config tweak.
+
+#### 3.3.3 Work required (stage 5+)
+
+* **Option A** — extend `BrowserEvidenceValidator` to accept an optional
+  inject-request spec: `(inject_url, inject_method, inject_payload_params,
+  trigger_url)`. Backward-compat by defaulting `trigger_url = inject_url` and
+  skipping the inject step when no inject spec is provided (reflected case).
+* **Option B** — dedicated `XssStoredSpecialist` with its own inject-then-
+  trigger pipeline; shares `PayloadMutator` + payload library + the existing
+  browser oracle. Keeps `XssSpecialist` focused on reflected flows.
+* **Open design issues** (for stage 5+, not decisions here):
+  * Cookie/session sharing between the `http_tool` (inject POST via httpx)
+    and `PlaywrightBrowser` (trigger GET); both must carry the same DVWA
+    `PHPSESSID` / `security` cookies for the authenticated guestbook view.
+  * State cleanup — DVWA guestbook persists across runs; a cleanup fixture
+    (DB-level or UI-driven "Clear Guestbook") is required to keep tests
+    idempotent.
+  * Concurrent episodes / parallel test runs mutate shared DB state;
+    isolation strategy TBD.
+
+#### 3.3.4 Deferred to
+
+**Stage 5+.** Not planned for δ.β. Re-evaluate after SQLi (#4) and
+XSS-medium (#5) land and after any stage-5 browser-layer refactors (which
+may collapse the gap closure into a larger validator redesign).
 
 ### 3.4 SQLi (decision: **go**)
 
@@ -345,7 +394,120 @@ once `<script>` lands in `blocked_tags`).
 
 ## Section 4. Integrated plan for δ.β
 
-<!-- filled in δ.α.2.c -->
+#### 4.1 Scope
+
+Two scenarios go into δ.β: **#5 XSS medium** and **#4 SQLi**. **#3 Stored
+XSS** is deferred to stage 5+ (see 3.3.4). No other work in scope.
+
+#### 4.2 Proposed ordering
+
+Split into two micro-sessions:
+
+* **δ.β.1 — XSS medium first.** Low risk: reuses the reflected-low E2E
+  infrastructure end to end; the only production-adjacent change is a
+  one-line kwarg on `tests/support/dvwa_auth.py::authenticate`. Estimated
+  ~30-60 min in a Claude Code session.
+* **δ.β.2 — SQLi second.** Higher novelty: first E2E whose oracle bypasses
+  `ValidationGate`, new `state.validation_results`-free assertion paradigm
+  (trace-scan JSONL for `kind == "sqli_finding"` + `verified is True`, see
+  3.4.3 shape (A)), first end-to-end exercise of `SqliSpecialist` against
+  DVWA. Estimated ~60-90 min.
+
+Rationale: one or two confident E2E tests beat three shaky ones. Landing
+XSS medium first banks an incremental win even if SQLi uncovers planner/
+payload-selection surprises that bleed across session boundaries.
+
+**Single-session alternative** — XSS medium + SQLi in one δ.β (~1.5-2 h
+total). Risk: stream timeout truncates scope and SQLi spills into a re-
+session with partial context. **Recommendation: split** into δ.β.1 and
+δ.β.2.
+
+#### 4.3 Aggregated work items
+
+**Helper / production-adjacent (δ.β.1, cross-ref 3.5.4):**
+
+* `tests/support/dvwa_auth.py:62` — add `security_level: str = "low"` kwarg
+  to `authenticate(...)`. Default preserves back-compat for every existing
+  call site.
+* `tests/support/dvwa_auth.py:118` — replace the literal `"security": "low"`
+  form value with `"security": security_level`.
+* `tests/support/e2e_config.py::build_dvwa_runtime_config` — **no change**.
+  Rationale: security level belongs to the auth fixture, not to
+  `RuntimeConfig` (which has no `vuln_class` / `target_vuln_classes` knob
+  anyway, cf. 3.4.4).
+* `tests/unit/support/test_dvwa_auth.py` — +1-2 cases: (a) default call
+  still posts `security=low`; (b) `security_level="medium"` posts
+  `security=medium`.
+
+**New E2E test (δ.β.1, cross-ref 3.5.4/3.5.5):**
+
+* `tests/integration/e2e/test_dvwa_xss_reflected_medium.py`. Copy the
+  reflected-low layout; call `authenticate(..., security_level="medium")`
+  in the fixture; assert on `state.validation_results` as a **list of
+  dicts** via `r.get("level") in {"validated", "evidence"}` (not attribute
+  access — confirmed in 3.5.3).
+
+**New E2E test (δ.β.2, cross-ref 3.4.4/3.4.5):**
+
+* `tests/integration/e2e/test_dvwa_sqli_low.py`. `target_url` =
+  `".../vulnerabilities/sqli/?id=1&Submit=Submit"`; user prompt bias
+  (e.g. `"find SQL injection on {target}"`); assertion = trace-scan JSONL
+  for an `action` event whose `payload.action.params.kind == "sqli_finding"`
+  and `params.finding.verified is True` (3.4.3 shape (A)).
+* **Optional baseline** (`test_dvwa_sqli_no_vuln_baseline.py`) — **defer**,
+  not in δ.β scope. Rationale: `SqliSpecialist._discover_targets` bails on
+  targets with no `id`-like query param (see 3.4.4), so the negative case
+  is structurally blocked rather than oracle-blocked; coverage win is small
+  and the gate-regression angle (the XSS baseline's selling point)
+  bypasses the gate for SQLi anyway. Re-evaluate in 4.7 docs close.
+
+**Zero production-code changes.** Not `XssSpecialist`, `SqliSpecialist`,
+`ValidationGate`, `BrowserEvidenceValidator`, `HttpEvidenceValidator`,
+`RuntimeConfig`, `PayloadMutator`, or the payload library.
+
+#### 4.4 Expected test count delta
+
+* `pytest -q` default selection: **713 passed → 714-715 passed** (+1-2
+  unit tests for `dvwa_auth` kwarg). Baseline `1 skipped, 11 deselected`
+  unchanged.
+* `-m e2e_dvwa` selection: **+2 new E2E tests**
+  (`test_dvwa_xss_reflected_medium.py`, `test_dvwa_sqli_low.py`), both
+  deselected by default.
+* No newly-skipped tests.
+
+#### 4.5 Estimated session length
+
+* **δ.β.1 (XSS medium)** — short-to-medium, ~30-60 min Claude Code. Risks:
+  none material; full pattern reuse from reflected-low.
+* **δ.β.2 (SQLi)** — medium, ~60-90 min. Primary risk: `SqliSpecialist`
+  may not be selected by the planner/policy against DVWA despite a
+  biasing `target_url` + user prompt (arbitration is policy-side, not
+  vuln-class-routed, cf. Section 5 Q1). Mitigation: verify via trace
+  tail on first failure; adjust `user_prompt` wording or add
+  specialist-name hint if needed.
+
+#### 4.6 Open questions forwarded to δ.β
+
+* **δ.β.2**: is `user_prompt="find SQL injection on {target}"` enough
+  planner bias, or does the prompt need to mention the URL / the
+  specialist by name? Empirical — decide from the first E2E trace.
+* **δ.β.2**: run-time budget — current XSS default is `max_steps=12` /
+  `max_http_requests=60`; `SqliSpecialist` runs baseline (3 samples) +
+  up to 4 error probes (+3 extractions on hit) + up to 3 blind payloads
+  × 3 probes each at ~5s threshold. Pre-emptive bump: **`max_steps=16`,
+  `max_http_requests=80`** for the SQLi test.
+* **δ.β.1**: is `FilterInferrer` behaviour on DVWA medium observable in
+  the trace? If inference mimics a wrong filter model the trace gives
+  debug surface; if phase 4 picks `<img>` / `<svg>` cleanly, skip.
+* **Forwarded to 4.7 docs close** (not blockers for δ.β):
+  * Type of `state.validation_results` — `list[dict]` vs
+    `list[ValidationResult]` — and whether the list-of-dicts convention
+    should be codified.
+  * `FilterInferrer` case-mix blindness (DVWA high bypass) — future
+    specialist extension or acceptable gap.
+  * AWE 5-phase qualifier for SQLi (baseline/error/blind vs canonical
+    canary/context/filter/mutate/verify), cf. `inv #3`.
+
 
 
 ## Section 5. Open questions
