@@ -4,11 +4,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from penage.agents.coordinator import CoordinatorAgent
 from penage.core.actions import Action, ActionType
 from penage.core.form_assist import FormAssist
 from penage.core.guard import ExecutionGuard
 from penage.core.observations import Observation
-from penage.core.planner import Planner
 from penage.core.state import State
 from penage.core.state_updates import StateUpdater
 from penage.core.tracer import JsonlTracer
@@ -41,38 +41,8 @@ class Orchestrator:
     validator: Optional[EvidenceValidator] = None
     macro_executor: Optional[MacroExecutor] = None
     state_updater: Optional[StateUpdater] = None
-    planner: Optional[Planner] = None
+    coordinator: Optional[CoordinatorAgent] = None
     memory: Optional[MemoryStore] = None
-
-    system_prompt: str = (
-        "You are a planner. Return ONLY a JSON object with key 'actions' "
-        "where each action has: type (http/shell/python/macro/note), params, timeout_s, tags. "
-        "You may also set stop=true and stop_reason.\n"
-        "\n"
-        "Action types:\n"
-        "- http: web request. params must include method and url. For query string use params.params (dict). "
-        "For form/body fields use params.data (dict). Do NOT put credentials or form fields into params.params.\n"
-        "- shell: run a shell command in an isolated sandbox container. Use it for parsing, fuzzing, and quick checks.\n"
-        "- python: run short python code in the sandbox.\n"
-        "- macro: execute a high-level exploitation procedure. params must include name and args.\n"
-        "  Available macro names include replay_auth_session, follow_authenticated_branch, and probe_resource_family.\n"
-        "  Prefer macro when you already have a confirmed pivot or repeated multi-step workflow.\n"
-        "\n"
-        "Rules:\n"
-        "- Do NOT repeat the exact same request/action multiple times.\n"
-        "- Prefer the next unexplored step.\n"
-        "- Use BestHTTP* memory as primary context when available; do not overfit to the last short 404 page.\n"
-        "- Use RecentHTTPMemory, ResearchSummary, ResearchHypotheses, RecentFailures, ResearchNegatives, and ValidationResultsPreview.\n"
-        "- Use AuthConfusionHitsPreview when present; prefer replaying the strongest authenticated pivot over inventing unrelated ID guesses.\n"
-        "- Prefer branches that already have concrete evidence.\n"
-        "- If PromotedPivotTargets or PromotedPivotIds are present, prioritize follow-up actions that reuse that confirmed pivot before unrelated exploration.\n"
-        "- Prefer KnownPaths, but you MAY try up to 2 hypothesis URLs per step if strongly suggested by page content.\n"
-        "  Tag such actions with 'hypothesis'.\n"
-        "- Avoid recently failed paths and repeated action families unless there is new evidence.\n"
-        "- Avoid fetching static assets (paths starting with /static/ or ending with .css/.js/.png/.jpg/.svg/etc.) unless explicitly needed.\n"
-        "- If a request returns 405 Method Not Allowed, retry once using an allowed method (usually GET).\n"
-        "- For multi-step forms: preserve hidden fields from the last form and submit required fields.\n"
-    )
 
     def __post_init__(self) -> None:
         if self.validator is None:
@@ -85,10 +55,9 @@ class Orchestrator:
                 validator=self.validator,
             )
 
-        if self.planner is None:
-            self.planner = Planner(
+        if self.coordinator is None:
+            self.coordinator = CoordinatorAgent.build(
                 llm=self.llm,
-                system_prompt=self.system_prompt,
                 guard=self.guard,
                 url_guard=self.url_guard,
                 research_memory_syncer=self.state_updater,
@@ -153,11 +122,9 @@ class Orchestrator:
 
             self.state_updater.sync_research_memory_from_facts(st)
 
-            planning = await self.planner.choose_actions(step=step, user_prompt=user_prompt, state=st)
-
-            for llm_resp in planning.llm_responses:
-                token_usage = self.llm.token_usage(llm_resp)
-                tracker.record_llm_call("planner", self.llm.provider_name, token_usage)
+            planning = await self.coordinator.choose_actions(
+                step=step, user_prompt=user_prompt, state=st, tracker=tracker,
+            )
 
             if planning.note:
                 self.tracer.record_note(planning.note, step=step)
@@ -205,7 +172,7 @@ class Orchestrator:
                     st.notes.append("budget_exhausted:total_text_len")
                     break
 
-                self.tracer.record_action(a, step=step, agent="planner")
+                self.tracer.record_action(a, step=step, agent="coordinator")
 
                 a = self.form_assist.normalize_http_post(a, st)
 
@@ -234,7 +201,7 @@ class Orchestrator:
                 duration_s = (obs.elapsed_ms / 1000.0) if obs.elapsed_ms is not None else 0.0
                 if obs.elapsed_ms is not None:
                     st.tool_elapsed_ms_total += int(obs.elapsed_ms)
-                tracker.record_tool_call("planner", duration_s)
+                tracker.record_tool_call("coordinator", duration_s)
 
                 self.tracer.record_note(
                     f"usage:llm={st.llm_calls} tools={st.tool_calls_total} http={st.tool_calls_http} sb={st.tool_calls_sandbox} ms={st.tool_elapsed_ms_total}",
