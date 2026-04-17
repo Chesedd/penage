@@ -36,6 +36,8 @@ from penage.specialists.vulns.xss import XssSpecialist
 from penage.specialists.vulns.xxe import XxeSpecialist
 from penage.tools.runner import ToolRunner
 from penage.validation.browser import BrowserVerifier
+from penage.validation.gate import ValidationGate
+from penage.validation.http import HttpEvidenceValidator
 
 
 @dataclass(slots=True)
@@ -218,6 +220,22 @@ def build_memory(cfg: RuntimeConfig) -> MemoryStore:
     return MemoryStore(cfg.memory_db_path)
 
 
+def build_validation_gate(cfg: RuntimeConfig, llm: LLMClient) -> ValidationGate:
+    from penage.agents.validation import ValidationAgent
+
+    http_val = HttpEvidenceValidator()
+    agent: ValidationAgent | None = None
+
+    if cfg.validation_mode == "agent":
+        agent = ValidationAgent.build(llm=llm)
+
+    return ValidationGate(
+        http_validator=http_val,
+        validation_agent=agent,
+        validation_mode=cfg.validation_mode,
+    )
+
+
 def build_orchestrator(
     cfg: RuntimeConfig,
     *,
@@ -236,6 +254,7 @@ def build_orchestrator(
         specialists=build_specialists(cfg, llm, memory=memory, tools=tools, tracer=tracer),
         macro_executor=build_macro_executor(),
         memory=memory,
+        validation_gate=build_validation_gate(cfg, llm),
     )
 
 
