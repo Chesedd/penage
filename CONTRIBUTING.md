@@ -73,6 +73,23 @@ Then group by domain:
 - `tests/integration/macros/...`
 - etc.
 
+### Opt-in E2E suites
+
+Heavy end-to-end suites are behind pytest markers and default-deselected so
+`pytest -q` stays fast:
+
+- `e2e_dvwa` — drives a full episode against a live DVWA. Bring the stack
+  up with `docker compose -f compose/e2e_dvwa.yml up -d`, then run
+  `pytest -m e2e_dvwa tests/integration/e2e/ -o addopts= -v`. Tests skip
+  automatically if `DVWA_BASE_URL` (default `http://127.0.0.1:4280`)
+  isn't reachable.
+- `integration_slow` — chromium-launching integration checks. Run with
+  `pytest -m integration_slow -o addopts=`.
+
+In rootful Docker / Linux CI, set
+`RuntimeConfig.browser_launch_args=("--no-sandbox", "--disable-dev-shm-usage")`
+(the E2E fixture already does) so chromium's own sandbox is disabled.
+
 ## Security note
 
 This repository should be used only for authorized targets.

@@ -275,7 +275,10 @@ def build_browser(
     """
     if not cfg.browser_verification:
         return None
-    return PlaywrightBrowser(rate_limiter=rate_limiter)
+    return PlaywrightBrowser(
+        rate_limiter=rate_limiter,
+        launch_args=cfg.browser_launch_args,
+    )
 
 
 def build_validation_gate(
