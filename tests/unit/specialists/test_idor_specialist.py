@@ -213,15 +213,6 @@ def test_max_targets_respected():
 
 
 @pytest.mark.asyncio
-async def test_phases_4_5_not_implemented_raise():
-    specialist = IdorSpecialist(http_tool=None)
-    with pytest.raises(NotImplementedError):
-        await specialist._run_vertical_phase()
-    with pytest.raises(NotImplementedError):
-        specialist._finalize_candidate()
-
-
-@pytest.mark.asyncio
 async def test_passwords_not_written_to_state():
     secret = "secret_role_a_pw_9371"
     secret_b = "secret_role_b_pw_4820"
@@ -1347,3 +1338,481 @@ async def test_propose_async_phase_3_cookies_from_role_a(monkeypatch):
     assert target_calls, "phase 3 must have fired at least one request"
     for call in target_calls:
         assert call.params.get("cookies") == {"sid": "A-cookie"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (vertical)
+# ---------------------------------------------------------------------------
+
+
+def _obs_with_headers(status: int, body: str, headers: dict[str, str]) -> Observation:
+    return Observation(
+        ok=True, elapsed_ms=1,
+        data={"status_code": status, "text_full": body, "headers": dict(headers)},
+    )
+
+
+async def _run_vertical(specialist: IdorSpecialist, state: State):
+    from penage.specialists.vulns.idor import _BudgetedHttpTool
+
+    budgeted = _BudgetedHttpTool(
+        specialist.http_tool, state, cap=specialist.max_http_budget,
+    )
+    return await specialist._run_vertical_phase(
+        state=state, http_tool=budgeted, step=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vertical_skipped_when_role_b_not_established():
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(_noop), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/users"
+    _seed_role(state, "B", "bob", established=False)
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_vertical_no_admin_paths_returns_none():
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(_noop), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/home"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+def test_vertical_discovers_admin_url_from_last_http_url():
+    specialist = IdorSpecialist(http_tool=None)
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/users?tab=1"
+    urls = specialist._discover_admin_paths(state)
+    assert urls == ["http://x/admin/users"]
+
+
+def test_vertical_discovers_admin_url_from_recent_http_memory():
+    specialist = IdorSpecialist(http_tool=None)
+    state = State(base_url="http://x")
+    state.recent_http_memory = [
+        {"url": "http://x/home"},
+        {"url": "http://x/management/console?x=1"},
+    ]
+    urls = specialist._discover_admin_paths(state)
+    assert "http://x/management/console" in urls
+
+
+@pytest.mark.asyncio
+async def test_vertical_unauth_403_b_200_verified():
+    body_b = "admin dashboard welcome " * 10
+    routes = {
+        (empty := "http://x/admin/users"): empty,
+    }
+    _ = routes
+
+    def responder(action: Action) -> Observation:
+        if action.params.get("cookies") == {}:
+            return _obs(403, "forbidden")
+        return _obs(200, body_b)
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/users"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is not None
+    assert finding["verified"] is True
+    assert finding["kind"] == "idor_vertical_privilege"
+    specialist._findings.append(finding)
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 9.0
+
+
+@pytest.mark.asyncio
+async def test_vertical_unauth_redirect_to_login_b_200_verified():
+    body_b = "admin settings " * 10
+
+    def responder(action: Action) -> Observation:
+        if action.params.get("cookies") == {}:
+            return _obs_with_headers(302, "", {"Location": "/login?next=/admin"})
+        return _obs(200, body_b)
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/settings"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is not None
+    assert finding["verified"] is True
+    assert finding["evidence"]["unauth_status"] == 302
+
+
+@pytest.mark.asyncio
+async def test_vertical_unauth_401_b_200_verified():
+    body_b = "admin console content " * 10
+
+    def responder(action: Action) -> Observation:
+        if action.params.get("cookies") == {}:
+            return _obs(401, "unauthorized")
+        return _obs(200, body_b)
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/console"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is not None
+    assert finding["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_vertical_both_200_no_finding():
+    body = "open page content " * 10
+
+    def responder(action: Action) -> Observation:
+        return _obs(200, body)
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+
+
+@pytest.mark.asyncio
+async def test_vertical_both_403_no_finding():
+    def responder(action: Action) -> Observation:
+        return _obs(403, "forbidden")
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+
+
+@pytest.mark.asyncio
+async def test_vertical_b_body_too_short_no_finding():
+    def responder(action: Action) -> Observation:
+        if action.params.get("cookies") == {}:
+            return _obs(403, "forbidden")
+        return _obs(200, "tiny")  # <32 chars
+
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(responder), tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+
+
+@pytest.mark.asyncio
+async def test_vertical_respects_budget():
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(_noop), tracer=FakeTracer(),
+        max_http_budget=2,  # remaining < 3
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/users"
+    _seed_role(state, "B", "bob", established=True, cookies={"sid": "B-c"})
+    finding = await _run_vertical(specialist, state)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+def test_vertical_max_paths_respected():
+    specialist = IdorSpecialist(http_tool=None, max_vertical_paths=3)
+    state = State(base_url="http://x")
+    state.recent_http_memory = [
+        {"url": f"http://x/admin/p{i}"} for i in range(5)
+    ]
+    urls = specialist._discover_admin_paths(state)
+    assert len(urls) == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (candidate)
+# ---------------------------------------------------------------------------
+
+
+def _make_candidate_target() -> _IdorTarget:
+    return _IdorTarget(
+        url="http://x/account", id_param="id", id_value="42",
+        channel="GET", id_location="query", is_numeric=True,
+    )
+
+
+def test_candidate_status_differential_from_horizontal():
+    specialist = IdorSpecialist(http_tool=None)
+    target = _make_candidate_target()
+    obs = [{
+        "phase": "horizontal",
+        "signal": "status_differential",
+        "a_status": 200,
+        "b_status": 500,
+        "a_body_len": 1000,
+        "b_body_len": 200,
+    }]
+    cand = specialist._finalize_candidate(target=target, observations=obs)
+    assert cand is not None
+    assert cand["verified"] is False
+    assert cand["kind"] == "idor_status_differential"
+    assert cand["mode"] == "candidate"
+    specialist._findings.append(cand)
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 3.0
+
+
+def test_candidate_enum_status_spread():
+    specialist = IdorSpecialist(http_tool=None)
+    target = _make_candidate_target()
+    obs = [
+        {"phase": "enumeration", "probe_id": "41", "status": 404,
+         "result": "non_2xx"},
+        {"phase": "enumeration", "probe_id": "43", "status": 403,
+         "result": "non_2xx"},
+        {"phase": "enumeration", "probe_id": "40", "status": 500,
+         "result": "non_2xx"},
+    ]
+    cand = specialist._finalize_candidate(target=target, observations=obs)
+    assert cand is not None
+    assert cand["kind"] == "idor_enum_status_spread"
+    assert cand["evidence"]["status_spread"] == [403, 404, 500]
+    specialist._findings.append(cand)
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 2.0
+
+
+def test_candidate_enum_all_same_status_no_candidate():
+    specialist = IdorSpecialist(http_tool=None)
+    target = _make_candidate_target()
+    obs = [
+        {"phase": "enumeration", "probe_id": str(p), "status": 404,
+         "result": "non_2xx"}
+        for p in (41, 43, 40, 44)
+    ]
+    cand = specialist._finalize_candidate(target=target, observations=obs)
+    assert cand is None
+
+
+def test_candidate_no_observations_returns_none():
+    specialist = IdorSpecialist(http_tool=None)
+    target = _make_candidate_target()
+    cand = specialist._finalize_candidate(target=target, observations=[])
+    assert cand is None
+
+
+def test_candidate_ignored_when_verified_exists():
+    specialist = IdorSpecialist(http_tool=None)
+    specialist._findings.append({
+        "verified": False, "kind": "idor_status_differential",
+        "mode": "candidate", "summary": "cand",
+    })
+    specialist._findings.append({
+        "verified": True, "kind": "idor_horizontal_identical_body",
+        "mode": "horizontal", "summary": "leak",
+    })
+    cands = specialist._emit_if_any()
+    assert len(cands) == 1
+    assert cands[0].score == 12.0
+    assert "verified" in cands[0].action.tags
+
+
+# ---------------------------------------------------------------------------
+# _emit_if_any
+# ---------------------------------------------------------------------------
+
+
+def test_emit_prefers_verified_over_candidate():
+    specialist = IdorSpecialist(http_tool=None)
+    specialist._findings.append({
+        "verified": False, "kind": "idor_enum_status_spread",
+        "mode": "candidate", "summary": "cand",
+    })
+    specialist._findings.append({
+        "verified": True, "kind": "idor_enum_cross_owner",
+        "mode": "enumeration", "summary": "leak",
+    })
+    cands = specialist._emit_if_any()
+    assert len(cands) == 1
+    assert cands[0].score == 12.0
+
+
+def test_emit_candidate_score_3_for_status_differential():
+    specialist = IdorSpecialist(http_tool=None)
+    specialist._findings.append({
+        "verified": False, "kind": "idor_status_differential",
+        "mode": "candidate", "summary": "cand",
+    })
+    cands = specialist._emit_if_any()
+    assert len(cands) == 1
+    assert cands[0].score == 3.0
+    assert "unverified" in cands[0].action.tags
+
+
+def test_emit_candidate_score_2_for_enum_status_spread():
+    specialist = IdorSpecialist(http_tool=None)
+    specialist._findings.append({
+        "verified": False, "kind": "idor_enum_status_spread",
+        "mode": "candidate", "summary": "cand",
+    })
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 2.0
+    assert "unverified" in cands[0].action.tags
+
+
+def test_emit_empty_findings_returns_empty_list():
+    specialist = IdorSpecialist(http_tool=None)
+    assert specialist._emit_if_any() == []
+
+
+def test_emit_vertical_privilege_score_9():
+    specialist = IdorSpecialist(http_tool=None)
+    specialist._findings.append({
+        "verified": True, "kind": "idor_vertical_privilege",
+        "mode": "vertical", "summary": "priv",
+    })
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 9.0
+
+
+# ---------------------------------------------------------------------------
+# Integration / flow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_full_flow_no_creds_discovery_only():
+    specialist = IdorSpecialist(
+        http_tool=FakeHttp(_noop), tracer=FakeTracer(),
+        role_a_password="", role_b_password="",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/r?id=1"
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_full_flow_horizontal_verified_short_circuits(monkeypatch):
+    # Horizontal returns identical body for A and B => verified on phase 2;
+    # phases 3/4/5 must not fire.
+    body = "x" * 512
+    routes = {
+        "http://x/r?id=42": _obs(200, body),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes), tracer=FakeTracer(),
+        role_a_password="pwA", role_b_password="pwB",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/r?id=42"
+    state.auth_roles.login_url = "http://x/login"
+    _seed_role(state, "A", "alice")
+    _seed_role(state, "B", "bob")
+
+    async def fake_login_role(*, http_tool, login_url, role_name, username,
+                               password, user_field, pass_field):
+        return LoginAttemptResult(
+            session=RoleSession(
+                role_name=role_name, username=username,
+                cookies={"sid": f"{role_name}-c"}, established=True,
+            ),
+            status_code=200, response_url=login_url,
+            set_cookie_count=1, failure_reason=None,
+        )
+
+    monkeypatch.setattr(
+        "penage.specialists.vulns.idor.login_role", fake_login_role,
+    )
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    assert out[0].metadata["evidence"]["kind"] == "idor_horizontal_identical_body"
+    # No probe URLs fired (phase 3) and no unauth cookies-empty probes (phase 4).
+    for call in specialist.http_tool.calls:
+        cookies = call.params.get("cookies")
+        # Only A or B cookies observed — no "{}" unauth phase-4 probe.
+        assert cookies != {}
+
+
+@pytest.mark.asyncio
+async def test_full_flow_vertical_runs_only_after_all_targets_exhausted(
+    monkeypatch,
+):
+    # Phase 2/3 do not verify; phase 4 fires once and verifies.
+    body_b = "admin area " * 10
+
+    class DualHttp:
+        def __init__(self) -> None:
+            self.calls: list[Action] = []
+
+        async def run(self, action: Action) -> Observation:
+            self.calls.append(action)
+            url = action.params.get("url") or ""
+            cookies = action.params.get("cookies") or {}
+            if "/admin" in url:
+                if cookies == {}:
+                    return _obs(403, "forbidden")
+                return _obs(200, body_b)
+            # Non-admin resource: distinct, marker-free bodies per role to
+            # prevent horizontal/enum from verifying. Role A gets unique
+            # per-URL content so enum probes do not hash-match baseline.
+            sid = cookies.get("sid", "anon")
+            return _obs(
+                200,
+                f"role {sid} page {url} " + "lorem ipsum filler " * 20,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    specialist = IdorSpecialist(
+        http_tool=DualHttp(), tracer=FakeTracer(),
+        role_a_password="pwA", role_b_password="pwB",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/admin/users"
+    state.recent_http_memory = [{"url": "http://x/r?id=42"}]
+    state.auth_roles.login_url = "http://x/login"
+    _seed_role(state, "A", "alice")
+    _seed_role(state, "B", "bob")
+
+    async def fake_login_role(*, http_tool, login_url, role_name, username,
+                               password, user_field, pass_field):
+        return LoginAttemptResult(
+            session=RoleSession(
+                role_name=role_name, username=username,
+                cookies={"sid": f"{role_name}-c"}, established=True,
+            ),
+            status_code=200, response_url=login_url,
+            set_cookie_count=1, failure_reason=None,
+        )
+
+    monkeypatch.setattr(
+        "penage.specialists.vulns.idor.login_role", fake_login_role,
+    )
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    finding = out[0].metadata["evidence"]
+    assert finding["kind"] == "idor_vertical_privilege"
+    assert out[0].score == 9.0
