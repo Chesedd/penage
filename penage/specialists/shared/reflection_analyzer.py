@@ -32,6 +32,7 @@ class ReflectionContextType(str, Enum):
     URL_REDIRECT = "url_redirect"
     NOT_REFLECTED = "not_reflected"
     SSRF_URL_PARAM = "ssrf_url_param"
+    CMDINJ_PARAM = "cmdinj_param"
 
 
 @dataclass(frozen=True, slots=True)

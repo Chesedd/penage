@@ -116,6 +116,14 @@ Examples:
   Emits `ssrf_oob` / `ssrf_metadata_leak` verified findings or an
   `ssrf_candidate` unverified finding (score 4.0) when only partial
   signals survive (5xx after scheme-bypass, outbound-latency hint).
+- `CmdInjSpecialist` — AWE-pattern command-injection probe with
+  echo-marker reflection, OS fingerprinting, OS-aware blind-timing
+  (2-of-3 elapsed_ms consistency above the baseline), and LLM
+  mutation of separators/encodings. Every outgoing payload — base,
+  YAML-curated, or mutated — passes through `DestructiveCommandFilter`.
+  Emits `cmdinj_echo` / `cmdinj_blind` verified findings, or
+  `cmdinj_reflected_no_exec` / `cmdinj_timing_noise` / `cmdinj_blocked`
+  candidates when only partial signals remain.
 
 Manager and pipeline:
 
