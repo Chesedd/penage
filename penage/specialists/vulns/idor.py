@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -233,6 +234,26 @@ class IdorSpecialist(AsyncSpecialist):
                     f"b={bool(login_outcome.get('B'))}"
                 )
 
+            # Phase 3: sequential enumeration (role A only, numeric targets).
+            role_a = state.auth_roles.get("A")
+            if (
+                role_a is not None
+                and role_a.established
+                and target.is_numeric
+                and budgeted.remaining >= self.min_reserve_http
+            ):
+                self._trace_phase(
+                    3, "sequential_enumeration", step=step, target=target,
+                )
+                enum_finding = await self._run_enumeration_phase(
+                    state=state, target=target, http_tool=budgeted, step=step,
+                )
+                if enum_finding and enum_finding.get("verified"):
+                    self._findings.append(enum_finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+
             self._attempted.add(key)
 
         return self._emit_if_any()
@@ -251,8 +272,14 @@ class IdorSpecialist(AsyncSpecialist):
         )
         if kind == "idor_horizontal_identical_body":
             score = 12.0
-        else:
+        elif kind == "idor_enum_cross_owner":
+            score = 12.0
+        elif kind == "idor_horizontal_shared_markers":
             score = 11.0
+        elif kind == "idor_enum_identical_baseline":
+            score = 10.0
+        else:
+            score = 9.0
         return [
             CandidateAction(
                 action=action,
@@ -507,9 +534,218 @@ class IdorSpecialist(AsyncSpecialist):
     def _target_key(self, target: _IdorTarget) -> str:
         return f"{target.url}|{target.id_location}|{target.id_param}"
 
-    async def _run_enumeration_phase(self, *args: Any, **kwargs: Any) -> Any:
-        """Phase 3 - role A tries id+/-1..+/-5. Implemented in IDOR-4."""
-        raise NotImplementedError("Implemented in IDOR-4")
+    def _probe_params_with_id(
+        self,
+        target: _IdorTarget,
+        probe_id: str,
+        cookies: dict[str, str],
+    ) -> dict[str, Any]:
+        """Build action.params for a phase-3 probe with an arbitrary id."""
+        if target.id_location == "query":
+            url = _set_query_param(target.url, target.id_param, probe_id)
+            return {
+                "method": "GET",
+                "url": url,
+                "cookies": dict(cookies),
+                "follow_redirects": False,
+            }
+        if target.id_location == "path":
+            url = _replace_path_segment(
+                target.url, target.path_segment_index, probe_id,
+            )
+            return {
+                "method": "GET",
+                "url": url,
+                "cookies": dict(cookies),
+                "follow_redirects": False,
+            }
+        method = target.channel if target.channel in {"GET", "POST"} else "POST"
+        return {
+            "method": method,
+            "url": target.url,
+            "data": {target.id_param: probe_id},
+            "cookies": dict(cookies),
+            "follow_redirects": False,
+        }
+
+    async def _run_enumeration_phase(
+        self,
+        *,
+        state: State,
+        target: _IdorTarget,
+        http_tool: _BudgetedHttpTool,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 3: sequential ID enumeration using role A.
+
+        Only runs for numeric targets. Role A queries id+/-1..+/-N; any probe
+        that returns owner-scoped markers NOT present in A's own baseline,
+        OR a body byte-identical to A's baseline, is verified IDOR.
+        """
+        _ = step
+        if not target.is_numeric:
+            return None
+
+        registry = state.auth_roles
+        role_a = registry.get("A")
+        if role_a is None or not role_a.established:
+            return None
+
+        if http_tool.remaining < 3:
+            return None
+
+        from penage.specialists.shared.differential import extract_markers
+
+        base_params = self._build_target_request(target)
+        base_params["cookies"] = dict(role_a.cookies)
+
+        obs_baseline = await http_tool.run(
+            Action(type=ActionType.HTTP, params=base_params)
+        )
+        body_base, status_base = _extract_body_status(obs_baseline)
+        if status_base is None or not (200 <= status_base < 300):
+            self._note(
+                f"idor:enum_baseline_unavailable status={status_base} "
+                f"target={target.id_param}"
+            )
+            return None
+
+        markers_baseline = extract_markers(body_base)
+        baseline_tokens = markers_baseline.all_tokens()
+        baseline_hash = _hash_short(body_base)
+        key = self._target_key(target)
+
+        enum_ids = _build_enum_set(target.id_value, self.max_enumeration_probes)
+        if not enum_ids:
+            return None
+
+        probes_fired = 0
+        for probe_id in enum_ids:
+            if http_tool.remaining < 2:
+                break
+            probes_fired += 1
+
+            probe_params = self._probe_params_with_id(
+                target, probe_id, role_a.cookies,
+            )
+            obs_probe = await http_tool.run(
+                Action(type=ActionType.HTTP, params=probe_params)
+            )
+            body_probe, status_probe = _extract_body_status(obs_probe)
+
+            if status_probe is None or not (200 <= status_probe < 300):
+                self._observations.setdefault(key, []).append({
+                    "phase": "enumeration",
+                    "probe_id": probe_id,
+                    "status": status_probe,
+                    "result": "non_2xx",
+                })
+                continue
+
+            probe_hash = _hash_short(body_probe)
+            if (
+                len(body_probe) >= 32
+                and probe_hash == baseline_hash
+                and probe_id != target.id_value
+            ):
+                self._observations.setdefault(key, []).append({
+                    "phase": "enumeration",
+                    "probe_id": probe_id,
+                    "status": status_probe,
+                    "result": "identical_to_baseline",
+                })
+                self._record_attempt(
+                    host=_host_of(target.url),
+                    parameter=target.id_param,
+                    payload=probe_id,
+                    outcome="verified_enum_identical_baseline",
+                )
+                return {
+                    "verified": True,
+                    "kind": "idor_enum_identical_baseline",
+                    "mode": "enumeration",
+                    "parameter": target.id_param,
+                    "id_location": target.id_location,
+                    "id_value": target.id_value,
+                    "probe_id": probe_id,
+                    "channel": target.channel,
+                    "url": target.url,
+                    "evidence": {
+                        "signal": "identical_body_across_ids",
+                        "baseline_id": target.id_value,
+                        "probe_id": probe_id,
+                        "a_status": status_base,
+                        "probe_status": status_probe,
+                        "a_body_len": len(body_base),
+                        "probe_body_len": len(body_probe),
+                        "a_body_hash": baseline_hash,
+                        "probe_body_hash": probe_hash,
+                        "role_a_user": role_a.username,
+                        "probes_fired": probes_fired,
+                    },
+                    "summary": (
+                        f"IDOR: probe id={probe_id} returns byte-identical "
+                        f"body to baseline id={target.id_value}"
+                    ),
+                }
+
+            markers_probe = extract_markers(body_probe)
+            probe_tokens = markers_probe.all_tokens()
+            cross_tokens = sorted(probe_tokens - baseline_tokens)
+
+            self._observations.setdefault(key, []).append({
+                "phase": "enumeration",
+                "probe_id": probe_id,
+                "status": status_probe,
+                "result": "ok",
+                "cross_tokens_count": len(cross_tokens),
+                "probe_body_len": len(body_probe),
+            })
+
+            if cross_tokens:
+                self._record_attempt(
+                    host=_host_of(target.url),
+                    parameter=target.id_param,
+                    payload=probe_id,
+                    outcome="verified_enum_cross_owner_markers",
+                )
+                return {
+                    "verified": True,
+                    "kind": "idor_enum_cross_owner",
+                    "mode": "enumeration",
+                    "parameter": target.id_param,
+                    "id_location": target.id_location,
+                    "id_value": target.id_value,
+                    "probe_id": probe_id,
+                    "channel": target.channel,
+                    "url": target.url,
+                    "evidence": {
+                        "signal": "cross_owner_markers",
+                        "cross_owner_markers": cross_tokens[:16],
+                        "baseline_id": target.id_value,
+                        "probe_id": probe_id,
+                        "a_status": status_base,
+                        "probe_status": status_probe,
+                        "a_body_len": len(body_base),
+                        "probe_body_len": len(body_probe),
+                        "role_a_user": role_a.username,
+                        "probes_fired": probes_fired,
+                    },
+                    "summary": (
+                        f"IDOR: role A probing id={probe_id} sees "
+                        f"{len(cross_tokens)} owner-scoped token(s) "
+                        f"not in own baseline"
+                    ),
+                }
+
+            self._record_attempt(
+                host=_host_of(target.url),
+                parameter=target.id_param,
+                payload=probe_id,
+                outcome="enum_no_cross_markers",
+            )
+
+        return None
 
     async def _run_vertical_phase(self, *args: Any, **kwargs: Any) -> Any:
         """Phase 4 - unauth vs role B on admin paths. Implemented in IDOR-4."""
@@ -727,6 +963,53 @@ def _set_query_param(url: str, name: str, value: str) -> str:
     ]
     pairs.append((name, value))
     return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
+
+
+def _replace_path_segment(url: str, seg_index: int, new_value: str) -> str:
+    """Replace a non-empty path segment by zero-based index (matches discovery).
+
+    path_segment_index in _IdorTarget counts non-empty segments (see
+    `_discover_targets`, where segments are filtered via
+    ``[s for s in path.split("/") if s]``). This helper reproduces that
+    indexing. Returns the url unchanged if seg_index is out of range.
+    """
+    parsed = urlparse(url)
+    segments = parsed.path.split("/")
+    non_empty_indices = [i for i, s in enumerate(segments) if s]
+    if seg_index < 0 or seg_index >= len(non_empty_indices):
+        return url
+    real_idx = non_empty_indices[seg_index]
+    new_segments = list(segments)
+    new_segments[real_idx] = new_value
+    return urlunparse(parsed._replace(path="/".join(new_segments)))
+
+
+def _build_enum_set(id_value: str, n: int) -> list[str]:
+    """Produce an interleaved +/-1..+/-N enumeration set around a numeric id.
+
+    For id_value="42" with n=3 -> ["41","43","40","44","39","45"]. Skips
+    ids <= 0 (400-prone and in some systems map to admin records). Returns
+    an empty list for non-numeric input or non-positive n.
+    """
+    try:
+        base = int(id_value)
+    except (TypeError, ValueError):
+        return []
+    if base <= 0 or n <= 0:
+        return []
+    out: list[str] = []
+    for delta in range(1, n + 1):
+        below = base - delta
+        if below > 0:
+            out.append(str(below))
+        out.append(str(base + delta))
+    return out
+
+
+def _hash_short(body: str) -> str:
+    return hashlib.sha256(
+        (body or "").encode("utf-8", errors="ignore")
+    ).hexdigest()[:16]
 
 
 __all__ = ["IdorSpecialist"]
