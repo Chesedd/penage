@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -9,6 +10,7 @@ from penage.core.actions import Action
 from penage.core.observations import Observation
 from penage.core.state import State
 from penage.specialists.base import SpecialistConfig
+from penage.specialists.shared.oob_listener import OobHit
 from penage.specialists.vulns.xxe import XxeSpecialist, _XxeTarget
 
 
@@ -181,13 +183,8 @@ def test_target_discovery_max_targets_respected():
     assert len(targets) == 2
 
 
-@pytest.mark.asyncio
-async def test_phase_3_4_5_not_implemented_raise():
+def test_phase_5_not_implemented_raises():
     specialist = XxeSpecialist(http_tool=None, max_http_budget=25)
-    with pytest.raises(NotImplementedError):
-        await specialist._run_param_entity_phase()
-    with pytest.raises(NotImplementedError):
-        await specialist._run_oob_phase()
     with pytest.raises(NotImplementedError):
         specialist._finalize_candidate()
 
@@ -676,3 +673,293 @@ async def test_memory_record_attempt_called_with_verified_classic_outcome():
     assert recorded, "memory.record_attempt was never called"
     outcomes = [r["outcome"] for r in recorded]
     assert "verified_classic" in outcomes
+
+
+# ---------------------------------------------------------------------------
+# Phases 3 & 4 — parameter-entity + OOB blind
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeOobListener:
+    """Test double for :class:`OobListener`.
+
+    ``hit_to_return`` is what :meth:`wait_for_hit` yields (``None`` = timeout).
+    ``running`` toggles :attr:`is_running`. ``register_raises`` forces
+    :meth:`register_token` to raise for register-failure scenarios.
+    """
+
+    hit_to_return: OobHit | None = None
+    running: bool = True
+    token_seq: int = 0
+    probe_url_template: str = "http://127.0.0.1:55555/canary/{token}"
+    register_raises: BaseException | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self.running
+
+    async def register_token(self) -> tuple[str, str]:
+        if self.register_raises is not None:
+            raise self.register_raises
+        self.token_seq += 1
+        token = f"tok{self.token_seq:03d}" + "0" * max(0, 16 - 6)
+        return token, self.probe_url_template.format(token=token)
+
+    async def wait_for_hit(self, token: str, timeout_s: float) -> OobHit | None:
+        _ = (token, timeout_s)
+        return self.hit_to_return
+
+
+def _param_entity_passwd_entry() -> dict[str, Any]:
+    return {
+        "id": "xxe-param-passwd",
+        "category": "parameter_entity-unix",
+        "template": "parameter_entity",
+        "uri": "file:///etc/passwd",
+        "entity_name": "",
+        "content_type": "application/xml",
+        "payload": "",
+    }
+
+
+def _oob_passwd_entry() -> dict[str, Any]:
+    return {
+        "id": "xxe-oob-passwd",
+        "category": "oob_blind-unix",
+        "template": "oob_blind",
+        "uri": "{OOB_URL}",
+        "entity_name": "",
+        "content_type": "application/xml",
+        "local_file": "/etc/passwd",
+        "payload": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_phase_3_param_entity_passwd_verified():
+    # Classic probe comes first in propose_async: it must miss so phase 3 runs.
+    # ScriptedHttp returns passwd for EVERY request — phase 2 would already hit
+    # on the classic category, so we prime cache with only parameter_entity.
+    http = ScriptedHttp(body_for=lambda a: _PASSWD_LINE)
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+    _prime_cache(specialist, [_param_entity_passwd_entry()])
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    finding = out[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "xxe_param_entity_disclosure"
+    assert finding["mode"] == "parameter_entity"
+    assert finding["family"] == "unix_passwd"
+    assert finding["evidence"]["bypass_source"] == "parameter_entity"
+    # The payload MUST be a parameter-entity shape.
+    assert len(http.calls) == 1
+    body = http.calls[0].params["data"]
+    assert isinstance(body, str)
+    assert "<!ENTITY % param1 SYSTEM" in body
+
+
+@pytest.mark.asyncio
+async def test_phase_3_no_marker_no_finding():
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+    _prime_cache(specialist, [_param_entity_passwd_entry()])
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # A parameter-entity probe was sent even though no marker landed.
+    assert len(http.calls) == 1
+    body = http.calls[0].params["data"]
+    assert "<!ENTITY % param1 SYSTEM" in body
+
+
+@pytest.mark.asyncio
+async def test_phase_3_dos_payload_dropped():
+    http = ScriptedHttp(body_for=lambda a: "")
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25)
+
+    # Six entities trip XmlSafetyFilter.check → allowed=False.
+    recursive = (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE r [\n'
+        '  <!ENTITY a "x">\n'
+        '  <!ENTITY b "x">\n'
+        '  <!ENTITY c "x">\n'
+        '  <!ENTITY d "x">\n'
+        '  <!ENTITY e "x">\n'
+        '  <!ENTITY f "x">\n'
+        '  <!ENTITY g "x">\n'
+        ']>\n'
+        '<r>ok</r>'
+    )
+    # We can't make build_parameter_entity_payload produce that directly,
+    # but we can patch the helper the phase calls to force the DoS path.
+    from penage.specialists.vulns import xxe as xxe_module
+
+    orig = xxe_module.build_parameter_entity_payload
+    xxe_module.build_parameter_entity_payload = lambda uri: recursive  # type: ignore[assignment]
+    try:
+        _prime_cache(specialist, [_param_entity_passwd_entry()])
+        notes: list[str] = []
+        specialist._note = notes.append  # type: ignore[method-assign]
+        state = _state_with_xml_body_target()
+        out = await specialist.propose_async(state, config=SpecialistConfig())
+    finally:
+        xxe_module.build_parameter_entity_payload = orig  # type: ignore[assignment]
+
+    assert out == []
+    assert len(http.calls) == 0
+    assert any("xxe:dos_payload_dropped" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_phase_4_no_oob_listener_skips_gracefully():
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    specialist = XxeSpecialist(http_tool=http, max_http_budget=25, oob_listener=None)
+    _prime_cache(specialist, [_oob_passwd_entry()])
+
+    notes: list[str] = []
+    specialist._note = notes.append  # type: ignore[method-assign]
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    assert any("xxe:oob_listener_unavailable" in n for n in notes)
+    assert len(http.calls) == 0  # no payloads were dispatched.
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_listener_not_running_skips():
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    listener = _FakeOobListener(hit_to_return=None, running=False)
+    specialist = XxeSpecialist(
+        http_tool=http,
+        max_http_budget=25,
+        oob_listener=listener,  # type: ignore[arg-type]
+    )
+    _prime_cache(specialist, [_oob_passwd_entry()])
+
+    notes: list[str] = []
+    specialist._note = notes.append  # type: ignore[method-assign]
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    assert any("xxe:oob_listener_unavailable" in n for n in notes)
+    assert len(http.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_hit_produces_verified_blind_finding():
+    hit = OobHit(
+        token="tok001" + "0" * 10,
+        remote_addr="10.0.0.7",
+        path="/canary/tok0010000000000000",
+        headers={"User-Agent": "libxml2/2.9.14"},
+        ts=time.time(),
+    )
+    listener = _FakeOobListener(hit_to_return=hit, running=True)
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    specialist = XxeSpecialist(
+        http_tool=http,
+        max_http_budget=25,
+        oob_listener=listener,  # type: ignore[arg-type]
+    )
+    _prime_cache(specialist, [_oob_passwd_entry()])
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+
+    assert len(out) == 1
+    finding = out[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "xxe_oob_blind"
+    assert finding["mode"] == "oob_blind"
+    assert finding["family"] == "oob_echo"
+    assert finding["evidence"]["oob_hit"]["remote_addr"] == "10.0.0.7"
+    assert finding["evidence"]["oob_hit"]["path"] == "/canary/tok0010000000000000"
+    assert finding["evidence"]["local_file_probed"] == "/etc/passwd"
+    assert finding["evidence"]["bypass_source"] == "oob_blind"
+    # At least one HTTP probe was fired.
+    assert len(http.calls) >= 1
+    body = http.calls[0].params["data"]
+    assert "file:///etc/passwd" in body
+    assert "127.0.0.1:55555" in body
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_timeout_no_finding():
+    listener = _FakeOobListener(hit_to_return=None, running=True)
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    specialist = XxeSpecialist(
+        http_tool=http,
+        max_http_budget=25,
+        oob_listener=listener,  # type: ignore[arg-type]
+        max_oob_payloads=1,
+    )
+    _prime_cache(specialist, [_oob_passwd_entry()])
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # The payload fired even though no hit landed.
+    assert len(http.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_register_failure_noted_continues():
+    listener = _FakeOobListener(
+        hit_to_return=None,
+        running=True,
+        register_raises=RuntimeError("boom"),
+    )
+    http = ScriptedHttp(body_for=lambda a: "<response>neutral</response>")
+    specialist = XxeSpecialist(
+        http_tool=http,
+        max_http_budget=25,
+        oob_listener=listener,  # type: ignore[arg-type]
+        max_oob_payloads=2,
+    )
+    _prime_cache(
+        specialist,
+        [_oob_passwd_entry(), _oob_passwd_entry()],
+    )
+
+    notes: list[str] = []
+    specialist._note = notes.append  # type: ignore[method-assign]
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert out == []
+    # Every entry tried registration and failed — no HTTP dispatched.
+    assert len(http.calls) == 0
+    assert any("xxe:oob_register_failed" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_verified_oob_evidence_includes_remote_addr_and_path():
+    hit = OobHit(
+        token="tok001" + "0" * 10,
+        remote_addr="192.0.2.55",
+        path="/canary/tok0010000000000000",
+        headers={"User-Agent": "libxml2/2.9"},
+        ts=time.time(),
+    )
+    listener = _FakeOobListener(hit_to_return=hit, running=True)
+    http = ScriptedHttp(body_for=lambda a: "")
+    specialist = XxeSpecialist(
+        http_tool=http,
+        max_http_budget=25,
+        oob_listener=listener,  # type: ignore[arg-type]
+    )
+    _prime_cache(specialist, [_oob_passwd_entry()])
+
+    state = _state_with_xml_body_target()
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    evidence = out[0].metadata["evidence"]["evidence"]
+    assert evidence["oob_hit"]["remote_addr"] == "192.0.2.55"
+    assert evidence["oob_hit"]["path"] == "/canary/tok0010000000000000"
