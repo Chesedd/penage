@@ -64,17 +64,20 @@ async def authenticate(
     username: str = "admin",
     password: str = "password",
     *,
+    security_level: str = "low",
     timeout: float = 10.0,
 ) -> DvwaSession:
-    """Log into DVWA, ensure the DB is seeded, and force security ``low``.
+    """Log into DVWA, ensure the DB is seeded, and force ``security_level``.
 
     Returns a :class:`DvwaSession` with the authenticated cookie jar
     (typically ``PHPSESSID`` and — on newer DVWA builds —
     ``security`` / ``dvwa-security-level-cookie``).
 
     The function is idempotent against a warm DVWA instance: re-running
-    ``create_db`` just resets the DB, and resetting security to ``low``
-    is the baseline for all β-scope scenarios.
+    ``create_db`` just resets the DB, and the security level is set to
+    ``security_level`` (default ``"low"`` — the baseline for β-scope
+    scenarios; pass ``"medium"`` / ``"high"`` / ``"impossible"`` for
+    higher-difficulty scenarios). The value is forwarded to DVWA as-is.
     """
     async with httpx.AsyncClient(
         base_url=base_url,
@@ -115,7 +118,7 @@ async def authenticate(
         await client.post(
             "/security.php",
             data={
-                "security": "low",
+                "security": security_level,
                 "seclev_submit": "Submit",
                 "user_token": token,
             },
