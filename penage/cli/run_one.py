@@ -118,6 +118,13 @@ def parse_args() -> argparse.Namespace:
         help="Validation gate mode: http = fast HTTP/Browser only (back-compat); "
              "agent = add ValidationAgent LLM confirmation (Stage 3.3).",
     )
+    p.add_argument(
+        "--no-parallel-specialists",
+        action="store_true",
+        default=False,
+        help="Disable parallel specialist delegation — run them sequentially "
+             "(Stage 3.7 ablation flag).",
+    )
 
     return p.parse_args()
 

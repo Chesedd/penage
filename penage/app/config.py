@@ -62,6 +62,10 @@ class RuntimeConfig:
     correlation_stop_enabled: bool = True
     validation_mode: str = "http"
 
+    # Stage 3.7 — parallel delegation across specialists via asyncio.gather.
+    # Ablation-compatible: set to False to fall back to the sequential path.
+    parallel_specialists: bool = True
+
 
 def _idor_cred_from_args_or_env(
     args: Namespace,
@@ -137,4 +141,5 @@ def runtime_config_from_args(args: Namespace) -> RuntimeConfig:
         sandbox_concurrency=int(args.sandbox_concurrency),
         correlation_stop_enabled=not bool(args.no_correlation_stop),
         validation_mode=str(args.validation_mode),
+        parallel_specialists=not bool(getattr(args, "no_parallel_specialists", False)),
     )

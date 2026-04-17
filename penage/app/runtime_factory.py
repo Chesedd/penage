@@ -232,6 +232,7 @@ def build_specialists(
         ],
         llm=llm,
         memory=memory,
+        parallel_specialists=cfg.parallel_specialists,
     )
 
 
