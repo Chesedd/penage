@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 
-KNOWN_ROLES = ("specialist", "validator", "coordinator", "sandbox")
+KNOWN_ROLES = ("specialist", "validation", "coordinator", "sandbox")
 
 
 @dataclass(slots=True)
