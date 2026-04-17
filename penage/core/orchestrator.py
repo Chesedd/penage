@@ -88,23 +88,29 @@ class Orchestrator:
         tracker = UsageTracker()
         self.tracer.record_note("episode_start", step=0)
 
-        with bind_usage_tracker(tracker):
-            for step in range(1, max_steps + 1):
-                outcome = await self._run_step(
-                    st=st,
-                    step=step,
-                    user_prompt=user_prompt,
-                    tracker=tracker,
-                    actions_per_step=actions_per_step,
-                    max_http_requests=max_http_requests,
-                    max_total_text_len=max_total_text_len,
-                    early_stop=early_stop,
-                    stop_condition=stop_condition,
-                )
-                if outcome.stop:
-                    break
+        try:
+            with bind_usage_tracker(tracker):
+                for step in range(1, max_steps + 1):
+                    outcome = await self._run_step(
+                        st=st,
+                        step=step,
+                        user_prompt=user_prompt,
+                        tracker=tracker,
+                        actions_per_step=actions_per_step,
+                        max_http_requests=max_http_requests,
+                        max_total_text_len=max_total_text_len,
+                        early_stop=early_stop,
+                        stop_condition=stop_condition,
+                    )
+                    if outcome.stop:
+                        break
+        finally:
+            self.tracer.record_note("episode_end", step=max_steps)
+            try:
+                await self.tools.aclose()
+            except Exception:  # LEGACY: defensive cleanup, never hide user exceptions
+                pass
 
-        self.tracer.record_note("episode_end", step=max_steps)
         return st, tracker
 
     async def _run_step(
