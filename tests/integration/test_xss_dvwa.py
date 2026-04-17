@@ -191,7 +191,8 @@ async def test_xss_specialist_detects_reflected_xss_on_dvwa_low(dvwa_container):
         http_tool=http_tool,
         llm_client=llm,
         memory=MemoryStore(":memory:"),
-        browser_verifier=None,  # Browser binary unavailable in CI; HTTP-response heuristic will fire.
+        browser_validator=None,  # Browser binary unavailable in CI; reflection-only finding suffices.
+        validation_recorder=None,
         max_http_budget=40,
     )
 

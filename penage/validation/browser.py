@@ -1,11 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
-import time
-import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from penage.core.actions import Action
 from penage.core.observations import Observation
@@ -15,185 +12,53 @@ from penage.validation.base import ValidationResult
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_S = 10.0
-_DEFAULT_SCREENSHOT_DIR = Path("runs/screenshots")
-_TIMEOUT_NOTE = "[penage] verification timed out"
-
-_playwright_warning_emitted = False
-
-
-def _emit_missing_playwright_warning(exc: ImportError) -> None:
-    global _playwright_warning_emitted
-    if _playwright_warning_emitted:
-        return
-    _playwright_warning_emitted = True
-    logger.warning(
-        "Playwright is not installed (%s); BrowserVerifier will return "
-        "unavailable evidence. Install the 'browser' extra to enable browser verification.",
-        exc,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class BrowserEvidence:
-    script_executed: bool
-    dialog_triggered: bool
-    dom_mutations: list[str] = field(default_factory=list)
-    console_messages: list[str] = field(default_factory=list)
-    screenshot_path: Optional[Path] = None
-    available: bool = True
-
-    @classmethod
-    def unavailable(cls) -> "BrowserEvidence":
-        return cls(
-            script_executed=False,
-            dialog_triggered=False,
-            dom_mutations=[],
-            console_messages=[],
-            screenshot_path=None,
-            available=False,
-        )
-
-
-class BrowserVerifier:
-    """Headless Chromium verifier for detecting JS-execution evidence.
-
-    Uses Playwright's sync API. If Playwright is not importable, every call to
-    :meth:`verify` returns :meth:`BrowserEvidence.unavailable` and a single
-    warning is logged for the lifetime of the process.
-    """
-
-    def __init__(
-        self,
-        *,
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
-        screenshot_dir: Path | str = _DEFAULT_SCREENSHOT_DIR,
-    ) -> None:
-        self._timeout_s = float(timeout_s)
-        self._screenshot_dir = Path(screenshot_dir)
-
-    def verify(self, url: str, payload: str, expectation: str) -> BrowserEvidence:
-        """Render ``url`` in headless Chromium and collect execution evidence.
-
-        The caller is responsible for embedding ``payload`` into the URL, body,
-        or cookie jar before invoking this method. ``expectation`` is matched
-        against console output to flag script execution and is also used in
-        the screenshot filename for later correlation.
-        """
-        try:
-            from playwright.sync_api import Error as PlaywrightError
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            _emit_missing_playwright_warning(exc)
-            return BrowserEvidence.unavailable()
-
-        _ = payload
-
-        console_messages: list[str] = []
-        dom_mutations: list[str] = []
-        dialog_triggered = False
-        timed_out = False
-        screenshot_path: Optional[Path] = None
-        deadline = time.monotonic() + self._timeout_s
-        timeout_ms = max(1, int(self._timeout_s * 1000))
-
-        try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
-                try:
-                    context = browser.new_context()
-                    page = context.new_page()
-
-                    def _on_console(msg: object) -> None:
-                        try:
-                            text = msg.text  # type: ignore[attr-defined]
-                        except Exception:
-                            text = str(msg)
-                        console_messages.append(str(text))
-
-                    def _on_dialog(dialog: object) -> None:
-                        nonlocal dialog_triggered
-                        dialog_triggered = True
-                        try:
-                            console_messages.append(f"[dialog] {dialog.message}")  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                        try:
-                            dialog.dismiss()  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-
-                    page.on("console", _on_console)
-                    page.on("dialog", _on_dialog)
-
-                    try:
-                        page.goto(url, timeout=timeout_ms, wait_until="load")
-                    except PlaywrightTimeoutError:
-                        timed_out = True
-
-                    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-                    if remaining_ms > 0 and not timed_out:
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=remaining_ms)
-                        except PlaywrightTimeoutError:
-                            timed_out = True
-                        except PlaywrightError:
-                            pass
-
-                    try:
-                        mutations = page.evaluate(
-                            "() => Array.from(document.querySelectorAll('[data-penage-mutation]'))"
-                            ".map(el => el.getAttribute('data-penage-mutation'))"
-                        )
-                        if isinstance(mutations, list):
-                            dom_mutations = [str(m) for m in mutations if m is not None]
-                    except PlaywrightTimeoutError:
-                        timed_out = True
-                    except PlaywrightError:
-                        pass
-
-                    shot = self._screenshot_path_for(expectation)
-                    try:
-                        shot.parent.mkdir(parents=True, exist_ok=True)
-                        page.screenshot(path=str(shot), full_page=True)
-                        screenshot_path = shot
-                    except (PlaywrightError, OSError):
-                        screenshot_path = None
-                finally:
-                    try:
-                        browser.close()
-                    except PlaywrightError:
-                        pass
-        except PlaywrightError as exc:
-            console_messages.append(f"[penage] playwright error: {exc}")
-
-        if timed_out:
-            console_messages.append(_TIMEOUT_NOTE)
-
-        script_executed = (
-            dialog_triggered
-            or bool(dom_mutations)
-            or (bool(expectation) and any(expectation in msg for msg in console_messages))
-        )
-
-        return BrowserEvidence(
-            script_executed=script_executed,
-            dialog_triggered=dialog_triggered,
-            dom_mutations=list(dom_mutations),
-            console_messages=list(console_messages),
-            screenshot_path=screenshot_path,
-            available=True,
-        )
-
-    def _screenshot_path_for(self, expectation: str) -> Path:
-        token = uuid.uuid4().hex[:12]
-        safe_exp = "".join(c if c.isalnum() else "_" for c in expectation)[:24] or "evidence"
-        return self._screenshot_dir / f"{safe_exp}_{token}.png"
-
 
 DEFAULT_EXECUTION_MARKERS: tuple[str, ...] = ("__penage_xss_marker__",)
-DEFAULT_PROBE_EXPR: str = "window.__penage_xss_marker__ || ''"
+DEFAULT_PROBE_EXPR: str = "JSON.stringify(window.__penage_xss_marker__ || [])"
+
+_DOM_FRAGMENT_WINDOW: int = 160
+_DOM_FRAGMENT_CAP: int = 512
+
+
+def _dom_fragment_near(dom: str, payload: str, *, window: int = _DOM_FRAGMENT_WINDOW) -> str:
+    """Return a short substring of ``dom`` centred on the first ``payload`` hit.
+
+    Used to give the finding enough context to show where the payload landed
+    without dragging the full rendered document into the trace.
+    """
+    if not dom or not payload:
+        return ""
+    idx = dom.find(payload)
+    if idx < 0:
+        return ""
+    start = max(0, idx - window)
+    end = min(len(dom), idx + len(payload) + window)
+    return dom[start:end][:_DOM_FRAGMENT_CAP]
+
+
+def _parse_execution_markers(js_text: str) -> list[dict[str, Any]]:
+    """Parse the probe result as a JSON array of ``{type, message}`` records.
+
+    The :class:`penage.sandbox.playwright_browser.PlaywrightBrowser` init
+    script pushes dicts onto ``window.__penage_xss_marker__`` whenever a
+    payload triggers ``alert``/``confirm``/``prompt``. The default probe
+    serialises that array via ``JSON.stringify`` so we can read structured
+    records out of the evidence. Non-JSON / non-list results degrade to an
+    empty list.
+    """
+    if not js_text:
+        return []
+    try:
+        parsed = json.loads(js_text)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            out.append({str(k): v for k, v in item.items()})
+    return out
 
 
 class BrowserEvidenceValidator:
@@ -224,9 +89,23 @@ class BrowserEvidenceValidator:
        is not reflected, return ``None`` without calling ``eval_js`` — no
        reflection implies no execution, and this saves a round-trip when
        the browser is rate-limited.
-    3. Evaluate ``probe_expr``. If its string form contains any configured
-       ``execution_markers``, the finding is ``"validated"``; otherwise
-       ``"evidence"`` (reflection present, execution unconfirmed).
+    3. Evaluate ``probe_expr`` and parse the result as a JSON list of
+       ``{type, message}`` dialog records (matching the init script in
+       :class:`penage.sandbox.playwright_browser.PlaywrightBrowser`). A
+       non-empty list means the payload invoked ``alert``/``confirm``/
+       ``prompt`` and the finding is ``"validated"``. If the list is empty
+       but the raw probe text contains any configured ``execution_markers``
+       (used by non-default probe expressions), that also counts as
+       ``"validated"``. Otherwise the result is ``"evidence"`` (reflection
+       present, execution unconfirmed).
+
+    Evidence dict fields:
+
+    * ``url``, ``payload``, ``probe_expr``, ``js_result``, ``action_type``.
+    * ``reflection_dom_fragment`` — up to a few hundred chars of the rendered
+      DOM around the payload hit, so consumers can show *where* it landed.
+    * ``execution_markers`` — parsed dialog records from
+      ``window.__penage_xss_marker__`` (empty list if nothing executed).
 
     The validator never imports Playwright/Selenium/etc.: it accepts any
     object implementing the :class:`Browser` Protocol.
@@ -282,7 +161,11 @@ class BrowserEvidenceValidator:
             js_result = None
 
         js_text = str(js_result) if js_result is not None else ""
-        executed = any(marker in js_text for marker in self._execution_markers)
+        execution_markers = _parse_execution_markers(js_text)
+
+        executed = bool(execution_markers) or any(
+            marker in js_text for marker in self._execution_markers
+        )
 
         evidence: dict[str, object] = {
             "url": url,
@@ -290,6 +173,8 @@ class BrowserEvidenceValidator:
             "probe_expr": self._probe_expr,
             "js_result": js_text,
             "action_type": action.type.value,
+            "reflection_dom_fragment": _dom_fragment_near(dom or "", payload),
+            "execution_markers": execution_markers,
         }
 
         if executed:

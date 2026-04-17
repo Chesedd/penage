@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from penage.core.actions import Action, ActionType
@@ -7,11 +9,16 @@ from penage.core.observations import Observation
 from penage.core.state import State
 from penage.sandbox.browser_base import Browser
 from penage.sandbox.fake_browser import FakeBrowser
-from penage.validation.browser import BrowserEvidenceValidator
+from penage.validation.browser import (
+    DEFAULT_EXECUTION_MARKERS,
+    DEFAULT_PROBE_EXPR,
+    BrowserEvidenceValidator,
+)
 
 
-_MARKER = "__penage_xss_marker__"
-_PROBE = "window.__penage_xss_marker__ || ''"
+_MARKER = DEFAULT_EXECUTION_MARKERS[0]
+_PROBE = DEFAULT_PROBE_EXPR
+_JS_EXECUTED = json.dumps([{"type": "alert", "message": "xss"}])
 
 
 def _browser_action(
@@ -119,7 +126,7 @@ async def test_validator_returns_validated_when_probe_marker_present():
     payload = "<script>__penage_xss_marker__</script>"
     fake = FakeBrowser(
         dom_responses={url: f"<html><body>reflected: {payload}</body></html>"},
-        js_responses={_PROBE: _MARKER},
+        js_responses={_PROBE: _JS_EXECUTED},
     )
     validator = BrowserEvidenceValidator(browser=fake)
 
@@ -129,8 +136,33 @@ async def test_validator_returns_validated_when_probe_marker_present():
     assert result is not None
     assert result.level == "validated"
     assert result.kind == "xss_browser_execution"
-    assert result.evidence["js_result"] == _MARKER
+    assert result.evidence["js_result"] == _JS_EXECUTED
+    assert result.evidence["execution_markers"] == [
+        {"type": "alert", "message": "xss"}
+    ]
+    assert payload in result.evidence["reflection_dom_fragment"]
     assert fake.js_calls == [_PROBE]
+
+
+@pytest.mark.asyncio
+async def test_validator_falls_back_to_textual_marker_for_custom_probes():
+    """Non-default probes can still trigger execution via a marker substring."""
+    url = "http://target/vuln?q=payload"
+    payload = "<script>__penage_xss_marker__</script>"
+    custom_probe = "window.__penage_xss_marker__ || ''"
+    fake = FakeBrowser(
+        dom_responses={url: f"<html><body>reflected: {payload}</body></html>"},
+        js_responses={custom_probe: _MARKER},
+    )
+    validator = BrowserEvidenceValidator(browser=fake, probe_expr=custom_probe)
+
+    action = _browser_action(url=url, payload=payload)
+    result = await validator.validate(action=action, obs=_obs(), state=State())
+
+    assert result is not None
+    assert result.level == "validated"
+    assert result.evidence["js_result"] == _MARKER
+    assert result.evidence["execution_markers"] == []
 
 
 @pytest.mark.asyncio
