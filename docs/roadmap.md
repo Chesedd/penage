@@ -6,7 +6,7 @@
 
 ---
 
-Current stage: 3 — Multi-agent MAPTA-style
+Current stage: 4 — Реальный G-CTR (Stage 3 закрыт)
 
 ## Этап 0 — Текущее состояние (baseline)
 
@@ -169,9 +169,37 @@ probe → candidate finalize) и провязан в `runtime_factory.build_spec
 
 ## Этап 3 — Multi-agent MAPTA-style
 
-**Статус:** ⬜  
+**Статус:** ✅  
 **Цель:** разделить текущего моноагента на три роли с изолированными LLM-контекстами.  
 **Условия входа:** этап 2 закрыт (иначе Validation-агенту нечего валидировать).  
+
+### Закрытие этапа — чек-лист под-стадий
+
+- [x] 3.1 — skeleton agents/ + prompts/ + CLI flags
+- [x] 3.2 — CoordinatorAgent + prompt extraction + role rename
+- [x] 3.3.a — ValidationAgent (LLM-only, fail-closed)
+- [x] 3.3.b.i — ValidationGate standalone
+- [x] 3.3.b.ii — ValidationGate wired into Orchestrator + runtime_factory
+- [x] 3.4.a — RoleTaggedLLMClient + by_specialist usage map + ContextVar
+- [x] 3.4.b — SandboxAgent wrappers + per-specialist proxy wiring
+- [x] 3.5 — Orchestrator-as-bus (extract StepOutcome + _run_step/_run_action)
+- [x] 3.6 — per-episode Docker hardening (memory-swap, ulimits, init, log-driver) + tools.aclose lifecycle
+- [x] 3.7 — parallel specialist delegation via asyncio.gather
+- [x] 3.8 — correlation-based early stopping (no-evidence, policy-streak, repeat-ratio)
+- [x] 3.9 — e2e integration tests + ablation matrix
+- [x] 3.10 — Stage 3 close (docs/architecture, roadmap flip, CLAUDE.md invariants)
+
+Summary numbers: тестов на конец Stage 3 — **648 passed, 1 skipped**
+(на входе в 3.9 — ~603). Добавились integration e2e + ablation matrix +
+correlation early-stop юниты.
+
+### Deferred to Stage 4
+
+- Browser verification в validation gate (beyond HTTP reflection).
+- Rate-limit semaphore для parallel specialists (real LLM API).
+- Golden-trace snapshot testing (determinism guarantees).
+- End-to-end integration с реальным DVWA под Docker (не mock).
+
 
 **Условия выхода:**
 
