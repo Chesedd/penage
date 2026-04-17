@@ -21,7 +21,7 @@ from penage.policy.base import PolicyLayer
 from penage.specialists.manager import SpecialistManager
 from penage.tools.runner import ToolRunner
 from penage.utils.fingerprint import action_fingerprint
-from penage.validation.base import EvidenceValidator
+from penage.validation.gate import ValidationGate
 
 
 StopCondition = Callable[[State], Optional[str]]
@@ -38,21 +38,22 @@ class Orchestrator:
     form_assist: FormAssist = field(default_factory=FormAssist)
     specialists: Optional[SpecialistManager] = None
     policy: Optional[PolicyLayer] = None
-    validator: Optional[EvidenceValidator] = None
+    validation_gate: Optional[ValidationGate] = None
     macro_executor: Optional[MacroExecutor] = None
     state_updater: Optional[StateUpdater] = None
     coordinator: Optional[CoordinatorAgent] = None
     memory: Optional[MemoryStore] = None
 
     def __post_init__(self) -> None:
-        if self.validator is None:
-            from penage.validation.http import HttpEvidenceValidator
-            self.validator = HttpEvidenceValidator()
-
         if self.state_updater is None:
-            self.state_updater = StateUpdater(
-                tracer=self.tracer,
-                validator=self.validator,
+            self.state_updater = StateUpdater(tracer=self.tracer)
+
+        if self.validation_gate is None:
+            from penage.validation.http import HttpEvidenceValidator
+            self.validation_gate = ValidationGate(
+                http_validator=HttpEvidenceValidator(),
+                validation_agent=None,
+                validation_mode="http",
             )
 
         if self.coordinator is None:
@@ -209,7 +210,11 @@ class Orchestrator:
                 )
 
                 self.state_updater.update_state(st, a, obs)
-                self.state_updater.validate_and_record(st, a, obs, step=step)
+                vres = await self.validation_gate.validate(
+                    action=a, obs=obs, state=st, tracker=tracker,
+                )
+                if vres is not None:
+                    self.state_updater.validation_recorder.record(st, a, vres, step=step)
 
                 if self.memory is not None:
                     self._record_memory_attempt(a, obs, st)
