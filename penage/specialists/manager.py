@@ -18,11 +18,15 @@ class SpecialistManager:
     configs: Dict[str, SpecialistConfig] = field(default_factory=dict)
     llm: Optional[LLMClient] = None
     memory: Optional[MemoryStore] = None
+    parallel_specialists: bool = True
     proposal_runner: SpecialistProposalRunner = field(init=False)
     candidate_pool: CandidatePool = field(init=False)
 
     def __post_init__(self) -> None:
-        self.proposal_runner = SpecialistProposalRunner(configs=self.configs)
+        self.proposal_runner = SpecialistProposalRunner(
+            configs=self.configs,
+            parallel=self.parallel_specialists,
+        )
         self.candidate_pool = CandidatePool(per_source_cap=4)
 
     def propose_all(self, state: State) -> List[CandidateAction]:
