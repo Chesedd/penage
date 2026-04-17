@@ -19,6 +19,56 @@ class AuthState:
 
 
 @dataclass(slots=True)
+class RoleSession:
+    """Single named session (cookies + metadata) for one logical role.
+
+    Supports multi-role penetration tests (e.g. IDOR differential probes):
+    role-A is a regular user who owns some resource; role-B is another
+    regular user used to check whether role-A's resource is accessible
+    under B's cookies.
+
+    SECURITY: cookies are in-memory only; no persistence to disk. Use
+    AuthRoleRegistry to look up per-role sessions during a single episode.
+    """
+
+    role_name: str
+    username: str = ""
+    cookies: dict[str, str] = field(default_factory=dict)
+    established: bool = False
+    last_login_ts: float = 0.0
+    login_error: str = ""   # non-empty iff last attempt failed
+
+
+@dataclass(slots=True)
+class AuthRoleRegistry:
+    """Registry of named role sessions for multi-role specialists.
+
+    Populated by specialists (e.g. IdorSpecialist) via login utilities.
+    Reads via .get() or direct .roles access. Not thread-safe — writes
+    must be serialised by the orchestrator.
+
+    login_url is optional and may be auto-discovered from state.forms_by_url
+    by the login utility; CLI may also pre-configure it.
+    """
+
+    roles: dict[str, RoleSession] = field(default_factory=dict)
+    login_url: str = ""
+
+    def get(self, role_name: str) -> RoleSession | None:
+        return self.roles.get(role_name)
+
+    def upsert(self, session: RoleSession) -> None:
+        self.roles[session.role_name] = session
+
+    def has_established(self, role_name: str) -> bool:
+        sess = self.roles.get(role_name)
+        return sess is not None and sess.established
+
+    def established_roles(self) -> list[str]:
+        return [name for name, s in self.roles.items() if s.established]
+
+
+@dataclass(slots=True)
 class MacroState:
     """Macro execution results."""
 

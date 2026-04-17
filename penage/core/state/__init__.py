@@ -4,21 +4,25 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from penage.core.state.stores import (
+    AuthRoleRegistry,
     AuthState,
     CurlReconTracking,
     FilterModel,
     MacroState,
     ResearchTracking,
+    RoleSession,
     SpecialistTracking,
 )
 
 __all__ = [
     "State",
+    "AuthRoleRegistry",
     "AuthState",
     "CurlReconTracking",
     "FilterModel",
     "MacroState",
     "ResearchTracking",
+    "RoleSession",
     "SpecialistTracking",
 ]
 
@@ -110,6 +114,7 @@ class State:
 
     # --- typed sub-stores ---
     auth: AuthState = field(default_factory=AuthState)
+    auth_roles: AuthRoleRegistry = field(default_factory=AuthRoleRegistry)
     macro: MacroState = field(default_factory=MacroState)
     curl_recon: CurlReconTracking = field(default_factory=CurlReconTracking)
     research_tracking: ResearchTracking = field(default_factory=ResearchTracking)
