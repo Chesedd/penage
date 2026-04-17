@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, List
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from penage.core.actions import Action, ActionType
 from penage.core.candidates import CandidateAction
@@ -14,6 +14,11 @@ from penage.core.tracer import JsonlTracer
 from penage.llm.base import LLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import AsyncSpecialist, SpecialistConfig
+from penage.specialists.shared.differential import (
+    DifferentialSignal,
+    compare_responses,
+)
+from penage.specialists.shared.session_login import login_role
 from penage.tools.http_backend import HttpBackend
 
 logger = logging.getLogger(__name__)
@@ -191,24 +196,316 @@ class IdorSpecialist(AsyncSpecialist):
             self._note(f"idor:insufficient_budget cap={self.max_http_budget}")
             return []
 
+        budgeted = _BudgetedHttpTool(self.http_tool, state, cap=self.max_http_budget)
         step = int(getattr(state, "orch_step", 0))
+
+        login_outcome = await self._run_login_phase(
+            state=state, http_tool=budgeted, step=step,
+        )
+        both_roles_ready = bool(login_outcome.get("A") and login_outcome.get("B"))
+
         for target in targets[: self.max_targets]:
+            key = self._target_key(target)
+            if key in self._attempted:
+                continue
+            if budgeted.remaining < self.min_reserve_http:
+                self._note(f"idor:budget_low remaining={budgeted.remaining}")
+                break
+
             self._trace_phase(1, "target_discovery", step=step, target=target)
 
-        return []
+            if both_roles_ready:
+                self._trace_phase(
+                    2, "horizontal_differential", step=step, target=target,
+                )
+                finding = await self._run_horizontal_phase(
+                    state=state, target=target, http_tool=budgeted, step=step,
+                )
+                if finding and finding.get("verified"):
+                    self._findings.append(finding)
+                    self._done = True
+                    self._attempted.add(key)
+                    break
+            else:
+                self._note(
+                    f"idor:horizontal_skipped_no_roles "
+                    f"a={bool(login_outcome.get('A'))} "
+                    f"b={bool(login_outcome.get('B'))}"
+                )
+
+            self._attempted.add(key)
+
+        return self._emit_if_any()
 
     def _emit_if_any(self) -> List[CandidateAction]:
-        # In this session _findings is always empty; return [].
-        # Full emission logic lands in IDOR-4.
-        return []
+        verified = [f for f in self._findings if f.get("verified")]
+        if not verified:
+            return []
+        finding = verified[-1]
+        mode = finding.get("mode", "unknown")
+        kind = finding.get("kind", "unknown")
+        action = Action(
+            type=ActionType.NOTE,
+            params={"kind": "idor_finding", "finding": finding},
+            tags=["idor", "verified", mode, kind],
+        )
+        if kind == "idor_horizontal_identical_body":
+            score = 12.0
+        else:
+            score = 11.0
+        return [
+            CandidateAction(
+                action=action,
+                source=self.name,
+                score=score,
+                cost=0.0,
+                reason=finding.get("summary") or "IDOR finding",
+                metadata={"evidence": finding},
+            )
+        ]
 
-    async def _run_login_phase(self, *args: Any, **kwargs: Any) -> Any:
-        """Phase 0 - login role A and role B. Implemented in IDOR-3."""
-        raise NotImplementedError("Implemented in IDOR-3")
+    async def _run_login_phase(
+        self,
+        *,
+        state: State,
+        http_tool: _BudgetedHttpTool,
+        step: int,
+    ) -> dict[str, bool]:
+        """Phase 0: login role A and role B via shared.session_login.login_role.
 
-    async def _run_horizontal_phase(self, *args: Any, **kwargs: Any) -> Any:
-        """Phase 2 - role A vs role B on same resource. Implemented in IDOR-3."""
-        raise NotImplementedError("Implemented in IDOR-3")
+        Writes the resulting RoleSession back into state.auth_roles via
+        .upsert(). Returns {"A": bool, "B": bool} indicating which roles
+        are established after login.
+
+        SAFETY: passwords stay inside this method's stack. They never land
+        in trace, note, logger, or state.
+        """
+        registry = state.auth_roles
+        outcome: dict[str, bool] = {"A": False, "B": False}
+
+        role_passwords: dict[str, str] = {}
+        if self.role_a_password:
+            role_passwords["A"] = self.role_a_password
+        if self.role_b_password:
+            role_passwords["B"] = self.role_b_password
+
+        if not role_passwords:
+            self._note("idor:no_role_credentials_configured")
+            return outcome
+
+        login_url = registry.login_url or self._discover_login_url(state)
+        if not login_url:
+            self._note("idor:no_login_url")
+            return outcome
+
+        for role_name, password in role_passwords.items():
+            existing = registry.get(role_name)
+            if existing is None:
+                self._note(f"idor:role_not_seeded role={role_name}")
+                continue
+            if existing.established:
+                outcome[role_name] = True
+                continue
+
+            self._trace_phase(
+                0,
+                "role_login",
+                step=step,
+                target=None,
+                extra={"role": role_name, "login_url": login_url},
+            )
+
+            try:
+                result = await login_role(
+                    http_tool=http_tool,
+                    login_url=login_url,
+                    role_name=role_name,
+                    username=existing.username,
+                    password=password,
+                    user_field=self.login_user_field,
+                    pass_field=self.login_pass_field,
+                )
+            except Exception as exc:  # LEGACY: boundary
+                self._note(
+                    f"idor:login_exception role={role_name} "
+                    f"type={type(exc).__name__}"
+                )
+                continue
+
+            registry.upsert(result.session)
+            outcome[role_name] = result.session.established
+
+            if not result.session.established:
+                self._note(
+                    f"idor:login_failed role={role_name} "
+                    f"reason={result.failure_reason or 'unknown'}"
+                )
+            else:
+                self._note(
+                    f"idor:login_ok role={role_name} "
+                    f"cookies={result.set_cookie_count}"
+                )
+
+        return outcome
+
+    def _discover_login_url(self, state: State) -> str:
+        """Scan state.forms_by_url for the first form with a password input."""
+        forms_by_url = getattr(state, "forms_by_url", {}) or {}
+        for page_url, forms in forms_by_url.items():
+            for form in forms or []:
+                inputs = form.get("inputs") or []
+                has_password = any(
+                    str(inp.get("type") or "").lower() == "password"
+                    for inp in inputs
+                )
+                if has_password:
+                    action = str(form.get("action") or page_url or "")
+                    if action:
+                        return action
+        return ""
+
+    async def _run_horizontal_phase(
+        self,
+        *,
+        state: State,
+        target: _IdorTarget,
+        http_tool: _BudgetedHttpTool,
+        step: int,
+    ) -> dict[str, Any] | None:
+        """Phase 2: same resource, role A vs role B.
+
+        Fires the same request under role A's cookies, then role B's
+        cookies, and classifies the pair via compare_responses. Returns
+        a verified finding only on LEAK_IDENTICAL_BODY or
+        LEAK_SHARED_MARKERS; otherwise records the observation and
+        returns None.
+        """
+        _ = step
+        registry = state.auth_roles
+        role_a = registry.get("A")
+        role_b = registry.get("B")
+        if role_a is None or role_b is None:
+            return None
+        if not (role_a.established and role_b.established):
+            return None
+
+        if http_tool.remaining < 3:
+            return None
+
+        base_params = self._build_target_request(target)
+
+        a_params = dict(base_params)
+        a_params["cookies"] = dict(role_a.cookies)
+        obs_a = await http_tool.run(Action(type=ActionType.HTTP, params=a_params))
+
+        b_params = dict(base_params)
+        b_params["cookies"] = dict(role_b.cookies)
+        obs_b = await http_tool.run(Action(type=ActionType.HTTP, params=b_params))
+
+        a_body, a_status = _extract_body_status(obs_a)
+        b_body, b_status = _extract_body_status(obs_b)
+
+        comparison = compare_responses(
+            a_body=a_body,
+            a_status=a_status,
+            b_body=b_body,
+            b_status=b_status,
+        )
+
+        key = self._target_key(target)
+        self._observations.setdefault(key, []).append(
+            {
+                "phase": "horizontal",
+                "signal": comparison.signal.value,
+                "a_status": a_status,
+                "b_status": b_status,
+                "a_body_len": comparison.a_body_len,
+                "b_body_len": comparison.b_body_len,
+                "shared_markers_count": len(comparison.shared_markers),
+            }
+        )
+
+        verified = comparison.signal in (
+            DifferentialSignal.LEAK_IDENTICAL_BODY,
+            DifferentialSignal.LEAK_SHARED_MARKERS,
+        )
+
+        if not verified:
+            self._record_attempt(
+                host=_host_of(target.url),
+                parameter=target.id_param,
+                payload=target.id_value,
+                outcome=f"horizontal_{comparison.signal.value}",
+            )
+            return None
+
+        self._record_attempt(
+            host=_host_of(target.url),
+            parameter=target.id_param,
+            payload=target.id_value,
+            outcome=f"verified_horizontal_{comparison.signal.value}",
+        )
+
+        kind = (
+            "idor_horizontal_identical_body"
+            if comparison.signal == DifferentialSignal.LEAK_IDENTICAL_BODY
+            else "idor_horizontal_shared_markers"
+        )
+
+        return {
+            "verified": True,
+            "kind": kind,
+            "mode": "horizontal",
+            "parameter": target.id_param,
+            "id_location": target.id_location,
+            "id_value": target.id_value,
+            "channel": target.channel,
+            "url": target.url,
+            "evidence": {
+                "signal": comparison.signal.value,
+                "shared_markers": list(comparison.shared_markers),
+                "a_status": a_status,
+                "b_status": b_status,
+                "a_body_len": comparison.a_body_len,
+                "b_body_len": comparison.b_body_len,
+                "a_body_hash": comparison.a_body_hash,
+                "b_body_hash": comparison.b_body_hash,
+                "role_a_user": role_a.username,
+                "role_b_user": role_b.username,
+                "notes": list(comparison.notes),
+            },
+            "summary": (
+                f"IDOR: role B sees role A's resource at "
+                f"{target.id_location}={target.id_param} "
+                f"({comparison.signal.value})"
+            ),
+        }
+
+    def _build_target_request(self, target: _IdorTarget) -> dict[str, Any]:
+        """Construct httpx-style action.params for target, without cookies."""
+        if target.id_location == "query":
+            url = _set_query_param(target.url, target.id_param, target.id_value)
+            return {
+                "method": "GET",
+                "url": url,
+                "follow_redirects": False,
+            }
+        if target.id_location == "path":
+            return {
+                "method": "GET",
+                "url": target.url,
+                "follow_redirects": False,
+            }
+        method = target.channel if target.channel in {"GET", "POST"} else "POST"
+        return {
+            "method": method,
+            "url": target.url,
+            "data": {target.id_param: target.id_value},
+            "follow_redirects": False,
+        }
+
+    def _target_key(self, target: _IdorTarget) -> str:
+        return f"{target.url}|{target.id_location}|{target.id_param}"
 
     async def _run_enumeration_phase(self, *args: Any, **kwargs: Any) -> Any:
         """Phase 3 - role A tries id+/-1..+/-5. Implemented in IDOR-4."""
@@ -364,7 +661,7 @@ class IdorSpecialist(AsyncSpecialist):
         name: str,
         *,
         step: int,
-        target: _IdorTarget,
+        target: "_IdorTarget | None" = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
         if self.tracer is None:
@@ -374,12 +671,17 @@ class IdorSpecialist(AsyncSpecialist):
             "phase": phase_num,
             "phase_name": name,
             "step": step,
-            "url": target.url,
-            "channel": target.channel,
-            "id_location": target.id_location,
-            "id_param": target.id_param,
-            "is_numeric": target.is_numeric,
         }
+        if target is not None:
+            payload.update(
+                {
+                    "url": target.url,
+                    "channel": target.channel,
+                    "id_location": target.id_location,
+                    "id_param": target.id_param,
+                    "is_numeric": target.is_numeric,
+                }
+            )
         if extra:
             payload.update(extra)
         try:
@@ -406,6 +708,25 @@ def _host_of(url: str) -> str:
         return (urlparse(url).netloc or "").lower()
     except Exception:
         return ""
+
+
+def _extract_body_status(obs: Observation) -> tuple[str, int | None]:
+    if not obs.ok or not isinstance(obs.data, dict):
+        return "", None
+    body = str(obs.data.get("text_full") or obs.data.get("text_excerpt") or "")
+    status = obs.data.get("status_code")
+    return body, (int(status) if isinstance(status, int) else None)
+
+
+def _set_query_param(url: str, name: str, value: str) -> str:
+    parsed = urlparse(url)
+    pairs = [
+        (k, v)
+        for (k, v) in parse_qsl(parsed.query, keep_blank_values=True)
+        if k != name
+    ]
+    pairs.append((name, value))
+    return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
 
 
 __all__ = ["IdorSpecialist"]
