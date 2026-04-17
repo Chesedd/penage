@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from penage.agents import SandboxAgent
 from penage.agents.coordinator import CoordinatorAgent
 from penage.core.actions import Action, ActionType
 from penage.core.form_assist import FormAssist
@@ -43,6 +44,7 @@ class Orchestrator:
     state_updater: Optional[StateUpdater] = None
     coordinator: Optional[CoordinatorAgent] = None
     memory: Optional[MemoryStore] = None
+    sandbox_agents: Optional[dict[str, SandboxAgent]] = None
 
     def __post_init__(self) -> None:
         if self.state_updater is None:
