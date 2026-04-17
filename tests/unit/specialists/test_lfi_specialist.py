@@ -237,26 +237,43 @@ async def test_budget_exhaustion_handled():
 
 
 @pytest.mark.asyncio
-async def test_phase_4_5_not_implemented_yet():
-    specialist = LfiSpecialist(http_tool=None, max_http_budget=30)
-    target = _LfiTarget(url="http://localhost/v", parameter="file", channel="GET")
-    from penage.specialists.vulns.lfi import _BudgetedHttpTool  # type: ignore[attr-defined]
+async def test_phase_4_php_filter_respects_budget_only_when_no_listener():
+    """Phase 4 without an OobListener runs Probe A (php_filter) only."""
 
-    budget = _BudgetedHttpTool(
-        FakeHttp(responder=lambda a: _ok("", url="x")),
-        State(),
-        cap=10,
+    base_url = "http://localhost/view.php"
+    parameter = "file"
+
+    def respond(action: Action) -> Observation:
+        value = _param_value(action, parameter)
+        if value.startswith("php://filter/convert.base64-encode/resource="):
+            return _ok("<html>no marker</html>", url=str(action.params.get("url")))
+        return _ok("<html>no marker</html>", url=str(action.params.get("url")))
+
+    tracer = _FakeTracer()
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        tracer=tracer,
+        max_http_budget=30,
     )
-    with pytest.raises(NotImplementedError):
-        await specialist._run_oob_phase(
-            target=target,
-            http_tool=budget,
-            host="localhost",
-            config=SpecialistConfig(),
-            step=0,
+    state = _state_with_query_target(base_url, parameter, value="page.php")
+
+    await specialist.propose_async(state, config=SpecialistConfig())
+
+    # Phase 4 should have fired exactly one php_filter probe (Probe B skipped).
+    php_probes = [
+        c for c in http_tool.calls
+        if _param_value(c, parameter).startswith(
+            "php://filter/convert.base64-encode/resource="
         )
-    with pytest.raises(NotImplementedError):
-        specialist._finalize_candidate({"verified": True})
+    ]
+    assert len(php_probes) == 1
+    # file_oob_tried=False in the trace note.
+    assert any(
+        "lfi:oob_phase_no_verified" in n and "file_oob_tried=False" in n
+        for n in tracer.notes
+    )
 
 
 @pytest.mark.asyncio
@@ -815,3 +832,342 @@ async def test_phase_3_mutation_error_logged_no_crash(monkeypatch):
         "bypass_phase_no_verified" in n and "mutation_tried=0" in n
         for n in tracer.notes
     )
+
+
+# --- Phase 4 (OOB) -------------------------------------------------------
+
+
+import base64 as _b64
+
+
+def _php_base64_body() -> str:
+    """Build a response body that will trip the ``code_leak`` detector.
+
+    The detector regex requires a base64 block of at least 100 chars; the
+    decoded payload must contain at least one PHP-specific token.
+    """
+    php_code = (
+        "<?php\n"
+        "function greet($name) { return 'Hello, ' . $_GET['name']; }\n"
+        "$_POST['x'];\n"
+        "require('includes.php');\n"
+        "echo $_SERVER['HTTP_HOST'];\n"
+        "?>\n"
+    )
+    encoded = _b64.b64encode(php_code.encode("utf-8")).decode("ascii")
+    # Pad the block so it comfortably exceeds 100 chars after stripping ``=``.
+    while len(encoded.rstrip("=")) < 150:
+        encoded = _b64.b64encode(
+            (php_code + "// padding padding padding\n").encode("utf-8")
+        ).decode("ascii")
+        php_code = php_code + "// padding padding padding\n"
+    return f"<html>start {encoded} end</html>"
+
+
+class _FakeOobHit:
+    """Minimal stand-in for :class:`penage.specialists.shared.oob_listener.OobHit`."""
+
+    def __init__(self, token: str, remote_addr: str = "127.0.0.1", path: str = "") -> None:
+        self.token = token
+        self.remote_addr = remote_addr
+        self.path = path or f"/canary/{token}"
+        self.headers: dict[str, str] = {}
+        self.ts: float = 0.0
+
+
+class _FakeOobListener:
+    """In-memory stand-in for ``OobListener``.
+
+    ``hit_on_register`` — when True, :meth:`wait_for_hit` returns a hit
+    synthesized from the most recently registered token; when False,
+    returns ``None`` (simulates a timeout).
+    """
+
+    def __init__(
+        self,
+        *,
+        is_running: bool = True,
+        hit_on_register: bool = False,
+        register_raises: Exception | None = None,
+    ) -> None:
+        self.is_running = is_running
+        self._hit_on_register = hit_on_register
+        self._register_raises = register_raises
+        self._last_token: str | None = None
+        self._last_url: str | None = None
+        self.register_calls = 0
+        self.wait_calls = 0
+
+    async def register_token(self) -> tuple[str, str]:
+        self.register_calls += 1
+        if self._register_raises is not None:
+            raise self._register_raises
+        token = f"tok{self.register_calls:04d}"
+        url = f"http://127.0.0.1:4040/canary/{token}"
+        self._last_token = token
+        self._last_url = url
+        return token, url
+
+    async def wait_for_hit(self, token: str, timeout_s: float) -> _FakeOobHit | None:
+        self.wait_calls += 1
+        if self._hit_on_register and token == self._last_token:
+            return _FakeOobHit(token=token)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_phase_4_php_filter_base64_decoded_detects_code_leak():
+    base_url = "http://localhost/view.php"
+    parameter = "file"
+
+    php_body = _php_base64_body()
+
+    def respond(action: Action) -> Observation:
+        value = _param_value(action, parameter)
+        if value.startswith("php://filter/convert.base64-encode/resource="):
+            return _ok(php_body, url=str(action.params.get("url")))
+        return _ok("<html>no marker</html>", url=str(action.params.get("url")))
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=MemoryStore(":memory:"),
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter, value="page.php")
+
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "lfi_code_leak_php"
+    assert finding["mode"] == "oob_php_filter"
+    assert finding["family"] == "code_leak"
+    assert finding["evidence"]["bypass_source"] == "php_filter"
+    assert cands[0].score == 12.0
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_hit_produces_ssrf_chain_finding():
+    base_url = "http://localhost/include"
+    parameter = "file"
+    listener = _FakeOobListener(is_running=True, hit_on_register=True)
+
+    def respond(action: Action) -> Observation:
+        return _ok("<html>benign page</html>", url=str(action.params.get("url")))
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        oob_listener=listener,  # type: ignore[arg-type]
+        max_http_budget=60,
+    )
+    state = _state_with_query_target(base_url, parameter)
+
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "lfi_ssrf_chain"
+    assert finding["mode"] == "oob_file_url"
+    assert finding["evidence"]["bypass_source"] == "oob_file_url"
+    assert finding["evidence"]["oob_hit"]["remote_addr"] == "127.0.0.1"
+    assert listener.register_calls >= 1
+    assert listener.wait_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_phase_4_no_oob_listener_skips_file_url_probe():
+    base_url = "http://localhost/view.php"
+    parameter = "file"
+    tracer = _FakeTracer()
+
+    def respond(action: Action) -> Observation:
+        return _ok("<html>no marker</html>", url=str(action.params.get("url")))
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        tracer=tracer,
+        oob_listener=None,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter, value="page.php")
+
+    await specialist.propose_async(state, config=SpecialistConfig())
+    # php_filter_tried=True, file_oob_tried=False — Probe A ran without Probe B.
+    assert any(
+        "lfi:oob_phase_no_verified" in n
+        and "php_filter_tried=True" in n
+        and "file_oob_tried=False" in n
+        for n in tracer.notes
+    )
+
+
+@pytest.mark.asyncio
+async def test_phase_4_oob_listener_not_running_skips():
+    base_url = "http://localhost/view.php"
+    parameter = "file"
+    tracer = _FakeTracer()
+    listener = _FakeOobListener(is_running=False)
+
+    def respond(action: Action) -> Observation:
+        return _ok("<html>no marker</html>", url=str(action.params.get("url")))
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        tracer=tracer,
+        oob_listener=listener,  # type: ignore[arg-type]
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter, value="page.php")
+
+    await specialist.propose_async(state, config=SpecialistConfig())
+    assert listener.register_calls == 0
+    assert listener.wait_calls == 0
+    assert any(
+        "lfi:oob_phase_no_verified" in n and "file_oob_tried=False" in n
+        for n in tracer.notes
+    )
+
+
+# --- Phase 5 (candidate finalization) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase_5_weak_signal_candidate_emitted():
+    base_url = "http://localhost/view"
+    parameter = "file"
+
+    def respond(action: Action) -> Observation:
+        # Body carries a bare ``root:`` (no full passwd format) — triggers
+        # _has_weak_marker without satisfying any strong detector.
+        return _ok(
+            "<html>error: root: access denied for /etc/passwd</html>",
+            url=str(action.params.get("url")),
+        )
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter)
+
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is False
+    assert finding["kind"] == "lfi_weak_signal"
+    assert finding["mode"] == "candidate"
+    assert finding["evidence"]["weak_marker"] is True
+    assert cands[0].score == 3.0
+
+
+@pytest.mark.asyncio
+async def test_phase_5_size_anomaly_candidate_emitted():
+    base_url = "http://localhost/view"
+    parameter = "file"
+
+    # 2000 chars, zero markers, no ``/etc/passwd`` string, no ``root:``.
+    big_body = "x" * 2000
+
+    def respond(action: Action) -> Observation:
+        return _ok(big_body, url=str(action.params.get("url")))
+
+    http_tool = FakeHttp(responder=respond)
+    specialist = LfiSpecialist(
+        http_tool=http_tool,
+        memory=None,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter)
+
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is False
+    assert finding["kind"] == "lfi_size_differential"
+    assert finding["evidence"]["size_anomaly"] is True
+    assert cands[0].score == 2.0
+
+
+@pytest.mark.asyncio
+async def test_phase_5_no_observations_returns_none():
+    specialist = LfiSpecialist(http_tool=None, max_http_budget=30)
+    target = _LfiTarget(
+        url="http://localhost/v", parameter="file", channel="GET"
+    )
+    out = specialist._finalize_candidate(
+        target=target, channel="GET", host_status_observations=[]
+    )
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_verified_finding_takes_precedence_over_candidate():
+    base_url = "http://localhost/view"
+    parameter = "file"
+
+    def respond(action: Action) -> Observation:
+        # Strong passwd marker on every response — phase 2 verifies on the
+        # first probe, so phase 5 candidate assembly is never reached.
+        return _ok(PASSWD_BODY, url=str(action.params.get("url")))
+
+    specialist = LfiSpecialist(
+        http_tool=FakeHttp(responder=respond),
+        memory=None,
+        max_http_budget=30,
+    )
+    state = _state_with_query_target(base_url, parameter)
+    cands = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(cands) == 1
+    finding = cands[0].metadata["evidence"]
+    assert finding["verified"] is True
+    assert finding["kind"] == "lfi_disclosure"
+    assert cands[0].score == 12.0
+
+
+# --- runtime_factory wiring ----------------------------------------------
+
+
+def test_runtime_factory_wires_lfi_specialist():
+    from pathlib import Path as _Path
+
+    from penage.app.config import RuntimeConfig
+    from penage.app.runtime_factory import build_specialists
+    from penage.core.guard import RunMode
+
+    cfg = RuntimeConfig(
+        base_url="http://localhost:8080",
+        llm_provider="ollama",
+        llm_model="llama3.1",
+        ollama_model="llama3.1",
+        ollama_url="http://localhost:11434",
+        trace_path=_Path("trace.jsonl"),
+        summary_path=None,
+        mode=RunMode.SAFE_HTTP,
+        allow_static=False,
+        actions_per_step=1,
+        max_steps=5,
+        max_http_requests=10,
+        max_total_text_len=1000,
+        enable_specialists=True,
+        policy_enabled=False,
+        sandbox_backend="null",
+        docker_image="python:3.12-slim",
+        docker_network="none",
+        experiment_tag="",
+        allowed_hosts=(),
+    )
+
+    manager = build_specialists(
+        cfg, _FakeLLM(), memory=None, tools=None, tracer=None
+    )
+    assert manager is not None
+    assert any(isinstance(s, LfiSpecialist) for s in manager.specialists)
