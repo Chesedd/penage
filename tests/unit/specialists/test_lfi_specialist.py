@@ -352,3 +352,65 @@ def test_export_from_vulns_package():
     from penage.specialists.vulns import LfiSpecialist as Exported
 
     assert Exported is LfiSpecialist
+
+
+_YAML_MIXED_CATEGORIES = """\
+- id: lfi-unix-1
+  category: unix
+  family: unix_passwd
+  depth: 3
+  payload: ../../../etc/passwd
+  expected_markers: []
+  notes: unix one
+- id: lfi-unix-2
+  category: unix
+  family: unix_hosts
+  depth: 3
+  payload: ../../../etc/hosts
+  expected_markers: []
+  notes: unix two
+- id: lfi-bypass-1
+  category: bypass
+  family: unix_passwd
+  depth: 4
+  payload: ....//....//....//etc/passwd
+  expected_markers: []
+  notes: bypass one
+- id: lfi-bypass-2
+  category: bypass
+  family: unix_passwd
+  depth: 4
+  payload: ..%2f..%2f..%2fetc%2fpasswd
+  expected_markers: []
+  notes: bypass two
+"""
+
+
+def test_load_yaml_entries_filters_by_bypass_category(tmp_path):
+    yaml_path = tmp_path / "lfi.yaml"
+    yaml_path.write_text(_YAML_MIXED_CATEGORIES, encoding="utf-8")
+    specialist = LfiSpecialist(
+        http_tool=None,
+        max_http_budget=30,
+        payload_library_path=yaml_path,
+    )
+    entries = specialist._load_yaml_entries(categories=("bypass",), limit=10)
+    assert len(entries) == 2
+    assert all(e["category"] == "bypass" for e in entries)
+    assert {e["id"] for e in entries} == {"lfi-bypass-1", "lfi-bypass-2"}
+
+
+def test_load_yaml_entries_multi_category(tmp_path):
+    yaml_path = tmp_path / "lfi.yaml"
+    yaml_path.write_text(_YAML_MIXED_CATEGORIES, encoding="utf-8")
+    specialist = LfiSpecialist(
+        http_tool=None,
+        max_http_budget=30,
+        payload_library_path=yaml_path,
+    )
+    entries = specialist._load_yaml_entries(
+        categories=("unix", "bypass"), limit=10
+    )
+    categories = {e["category"] for e in entries}
+    assert categories == {"unix", "bypass"}
+    assert len(entries) == 4
