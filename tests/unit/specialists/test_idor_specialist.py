@@ -213,10 +213,8 @@ def test_max_targets_respected():
 
 
 @pytest.mark.asyncio
-async def test_phases_3_4_5_not_implemented_raise():
+async def test_phases_4_5_not_implemented_raise():
     specialist = IdorSpecialist(http_tool=None)
-    with pytest.raises(NotImplementedError):
-        await specialist._run_enumeration_phase()
     with pytest.raises(NotImplementedError):
         await specialist._run_vertical_phase()
     with pytest.raises(NotImplementedError):
@@ -806,3 +804,546 @@ def test_emit_verified_shared_markers_score_11():
 def test_emit_nothing_when_no_findings():
     specialist = IdorSpecialist(http_tool=None)
     assert specialist._emit_if_any() == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (enumeration) helpers
+# ---------------------------------------------------------------------------
+
+
+def test_enum_set_basic_interleaved():
+    from penage.specialists.vulns.idor import _build_enum_set
+
+    assert _build_enum_set("42", 3) == ["41", "43", "40", "44", "39", "45"]
+
+
+def test_enum_set_lower_bound_zero_skipped():
+    from penage.specialists.vulns.idor import _build_enum_set
+
+    out = _build_enum_set("2", 5)
+    assert "0" not in out
+    assert "-1" not in out
+    assert "1" in out
+    assert all(int(x) >= 1 for x in out)
+
+
+def test_enum_set_base_one_no_below():
+    from penage.specialists.vulns.idor import _build_enum_set
+
+    assert _build_enum_set("1", 2) == ["2", "3"]
+
+
+def test_enum_set_non_numeric_returns_empty():
+    from penage.specialists.vulns.idor import _build_enum_set
+
+    assert _build_enum_set("abc", 5) == []
+
+
+def test_enum_set_zero_or_negative_n_returns_empty():
+    from penage.specialists.vulns.idor import _build_enum_set
+
+    assert _build_enum_set("42", 0) == []
+    assert _build_enum_set("42", -3) == []
+
+
+def test_replace_path_segment_basic():
+    from penage.specialists.vulns.idor import _replace_path_segment
+
+    # "/users/42/profile" — non-empty segments are ["users","42","profile"]
+    # index 1 = "42".
+    assert _replace_path_segment(
+        "http://x/users/42/profile", 1, "41",
+    ) == "http://x/users/41/profile"
+
+
+def test_replace_path_segment_middle():
+    from penage.specialists.vulns.idor import _replace_path_segment
+
+    # non-empty segments: ["api","v1","orders","99","items"], idx=3 -> "99"
+    assert _replace_path_segment(
+        "http://x/api/v1/orders/99/items", 3, "100",
+    ) == "http://x/api/v1/orders/100/items"
+
+
+def test_replace_path_segment_out_of_range_returns_unchanged():
+    from penage.specialists.vulns.idor import _replace_path_segment
+
+    url = "http://x/users/42"
+    assert _replace_path_segment(url, 5, "99") == url
+    assert _replace_path_segment(url, -1, "99") == url
+
+
+def test_replace_path_segment_preserves_query():
+    from penage.specialists.vulns.idor import _replace_path_segment
+
+    out = _replace_path_segment("http://x/users/42?ref=x", 1, "41")
+    assert out == "http://x/users/41?ref=x"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (enumeration) — unit
+# ---------------------------------------------------------------------------
+
+
+class FakeHttpByUrl:
+    """Fake http-tool that dispatches by (url, data-id) to an Observation."""
+
+    def __init__(self, routes: dict[str, Observation]) -> None:
+        self.routes = routes
+        self.calls: list[Action] = []
+
+    async def run(self, action: Action) -> Observation:
+        self.calls.append(action)
+        url = action.params.get("url", "")
+        data = action.params.get("data") or {}
+        # Form channel: key by data id value; query/path: key by URL.
+        if data:
+            for k, v in data.items():
+                composite = f"{url}|form|{k}={v}"
+                if composite in self.routes:
+                    return self.routes[composite]
+        return self.routes.get(url, Observation(
+            ok=True, elapsed_ms=1,
+            data={"status_code": 404, "text_full": ""},
+        ))
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _make_enum_state() -> tuple[State, _IdorTarget]:
+    state = State(base_url="http://x")
+    _seed_role(state, "A", "alice", established=True,
+               cookies={"sid": "A-cookie"})
+    target = _IdorTarget(
+        url="http://x/account",
+        id_param="id",
+        id_value="42",
+        channel="GET",
+        id_location="query",
+        is_numeric=True,
+    )
+    return state, target
+
+
+async def _run_enumeration(specialist: IdorSpecialist, state: State,
+                           target: _IdorTarget):
+    from penage.specialists.vulns.idor import _BudgetedHttpTool
+
+    budgeted = _BudgetedHttpTool(
+        specialist.http_tool, state, cap=specialist.max_http_budget,
+    )
+    return await specialist._run_enumeration_phase(
+        state=state, target=target, http_tool=budgeted, step=0,
+    )
+
+
+def _obs(status: int, body: str) -> Observation:
+    return Observation(
+        ok=True, elapsed_ms=1,
+        data={"status_code": status, "text_full": body},
+    )
+
+
+@pytest.mark.asyncio
+async def test_enum_cross_owner_markers_verified():
+    baseline_body = (
+        "<html>profile for alice@real.com"
+        + " padding " * 40
+        + "</html>"
+    )
+    probe_body = (
+        "<html>profile for bob@other.com"
+        + " filler " * 40
+        + "</html>"
+    )
+    routes = {
+        "http://x/account?id=42": _obs(200, baseline_body),
+        "http://x/account?id=41": _obs(200, probe_body),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is not None
+    assert finding["verified"] is True
+    assert finding["kind"] == "idor_enum_cross_owner"
+    assert finding["mode"] == "enumeration"
+    assert finding["probe_id"] == "41"
+    assert "bob@other.com" in finding["evidence"]["cross_owner_markers"]
+    # Emitted score is 12.0.
+    specialist._findings.append(finding)
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 12.0
+
+
+@pytest.mark.asyncio
+async def test_enum_identical_baseline_verified():
+    body = "x" * 512  # length >= 32, byte-identical both ways.
+    routes = {
+        "http://x/account?id=42": _obs(200, body),
+        "http://x/account?id=41": _obs(200, body),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is not None
+    assert finding["verified"] is True
+    assert finding["kind"] == "idor_enum_identical_baseline"
+    specialist._findings.append(finding)
+    cands = specialist._emit_if_any()
+    assert cands[0].score == 10.0
+
+
+@pytest.mark.asyncio
+async def test_enum_early_exit_on_first_verified():
+    baseline = "<html>alice@real.com" + " f " * 40 + "</html>"
+    leak = "<html>bob@other.com" + " g " * 40 + "</html>"
+    boring = "<html>nobody here" + " h " * 40 + "</html>"
+    # Baseline = id=42, probe1 (id=41) -> boring, probe2 (id=43) -> leak,
+    # probe3 (id=40) -> should not be fired.
+    routes = {
+        "http://x/account?id=42": _obs(200, baseline),
+        "http://x/account?id=41": _obs(200, boring),
+        "http://x/account?id=43": _obs(200, leak),
+        "http://x/account?id=40": _obs(200, leak),  # would leak too if fired
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is not None
+    assert finding["probe_id"] == "43"
+    urls = [c.params.get("url") for c in specialist.http_tool.calls]
+    assert "http://x/account?id=40" not in urls
+
+
+@pytest.mark.asyncio
+async def test_enum_skipped_for_uuid_target():
+    routes: dict[str, Observation] = {}
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    _seed_role(state, "A", "alice", established=True,
+               cookies={"sid": "A-cookie"})
+    target = _IdorTarget(
+        url="http://x/doc/550e8400-e29b-41d4-a716-446655440000",
+        id_param="__path_seg_1__",
+        id_value="550e8400-e29b-41d4-a716-446655440000",
+        channel="GET",
+        id_location="path",
+        is_numeric=False,
+        path_segment_index=1,
+    )
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_enum_skipped_when_role_a_not_established():
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl({}),
+        tracer=FakeTracer(),
+    )
+    state = State(base_url="http://x")
+    _seed_role(state, "A", "alice", established=False)
+    target = _IdorTarget(
+        url="http://x/account", id_param="id", id_value="42",
+        channel="GET", id_location="query", is_numeric=True,
+    )
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_enum_skipped_when_baseline_returns_non_2xx():
+    routes = {
+        "http://x/account?id=42": _obs(500, "boom"),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    # Only baseline call fired, no probes.
+    assert len(specialist.http_tool.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_enum_skipped_when_baseline_returns_error_obs():
+    class BaselineErrorHttp:
+        def __init__(self) -> None:
+            self.calls: list[Action] = []
+
+        async def run(self, action: Action) -> Observation:
+            self.calls.append(action)
+            return Observation(ok=False, error="net:boom", elapsed_ms=1)
+
+        async def aclose(self) -> None:
+            return None
+
+    specialist = IdorSpecialist(
+        http_tool=BaselineErrorHttp(),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    assert len(specialist.http_tool.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_enum_no_cross_markers_no_finding():
+    # Baseline contains alice; every probe returns a body with alice only
+    # (so marker set is subset of baseline).
+    baseline = "<html>alice@real.com" + " f " * 40 + "</html>"
+    same = "<html>alice@real.com" + " g " * 40 + "</html>"
+    routes = {
+        "http://x/account?id=42": _obs(200, baseline),
+        "http://x/account?id=41": _obs(200, same),
+        "http://x/account?id=43": _obs(200, same),
+        "http://x/account?id=40": _obs(200, same),
+        "http://x/account?id=44": _obs(200, same),
+        "http://x/account?id=39": _obs(200, same),
+        "http://x/account?id=45": _obs(200, same),
+        "http://x/account?id=38": _obs(200, same),
+        "http://x/account?id=46": _obs(200, same),
+        "http://x/account?id=37": _obs(200, same),
+        "http://x/account?id=47": _obs(200, same),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+
+
+@pytest.mark.asyncio
+async def test_enum_probes_with_non_2xx_recorded_as_non_2xx():
+    baseline = "<html>alice@real.com" + " f " * 40 + "</html>"
+    leak = "<html>bob@other.com" + " g " * 40 + "</html>"
+    routes = {
+        "http://x/account?id=42": _obs(200, baseline),
+        "http://x/account?id=41": _obs(404, ""),  # probe non-2xx
+        "http://x/account?id=43": _obs(200, leak),  # verified here
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is not None
+    key = specialist._target_key(target)
+    enum_obs = [o for o in specialist._observations[key]
+                if o.get("phase") == "enumeration"]
+    non_2xx = [o for o in enum_obs if o.get("result") == "non_2xx"]
+    assert non_2xx and non_2xx[0]["probe_id"] == "41"
+
+
+@pytest.mark.asyncio
+async def test_enum_respects_http_budget_low():
+    # remaining < 3 at entry -> phase skipped without firing.
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl({}),
+        tracer=FakeTracer(),
+        max_http_budget=2,
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    assert specialist.http_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_enum_respects_http_budget_mid_loop():
+    # Cap = 4: baseline uses 1, then only 2 more probes can fire (remaining
+    # drops from 3 to 2 after first probe, then 1 after second — break on
+    # remaining < 2 before third probe).
+    baseline = "<html>alice@real.com" + " f " * 40 + "</html>"
+    bland = "<html>nothing" + " h " * 40 + "</html>"
+    routes = {
+        "http://x/account?id=42": _obs(200, baseline),
+        "http://x/account?id=41": _obs(200, bland),
+        "http://x/account?id=43": _obs(200, bland),
+        "http://x/account?id=40": _obs(200, bland),
+    }
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=FakeTracer(),
+        max_http_budget=3,
+    )
+    state, target = _make_enum_state()
+    finding = await _run_enumeration(specialist, state, target)
+    assert finding is None
+    # 1 baseline + at most 2 probes before remaining<2 kicks in.
+    assert len(specialist.http_tool.calls) <= 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 integration via propose_async
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_propose_async_phase_3_runs_after_horizontal_fails(monkeypatch):
+    # Role A established, role B NOT established -> both_roles_ready is
+    # False -> phase 2 is skipped. Phase 3 should still run for numeric
+    # targets. Easier than mocking horizontal's internals.
+    baseline = "<html>alice@real.com" + " padding " * 40 + "</html>"
+    probe = "<html>bob@other.com" + " padding " * 40 + "</html>"
+    routes = {
+        "http://x/r?id=42": _obs(200, baseline),
+        "http://x/r?id=41": _obs(200, probe),
+    }
+    tracer = FakeTracer()
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=tracer,
+        role_a_password="pwA",
+        role_b_password="pwB",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/r?id=42"
+    state.auth_roles.login_url = "http://x/login"
+    _seed_role(state, "A", "alice")
+    _seed_role(state, "B", "bob")
+
+    async def fake_login_role(*, http_tool, login_url, role_name, username,
+                               password, user_field, pass_field):
+        established = role_name == "A"
+        return LoginAttemptResult(
+            session=RoleSession(
+                role_name=role_name, username=username,
+                cookies={"sid": "A-cookie"} if established else {},
+                established=established,
+            ),
+            status_code=200, response_url=login_url,
+            set_cookie_count=1 if established else 0,
+            failure_reason=None if established else "no_set_cookie",
+        )
+
+    monkeypatch.setattr(
+        "penage.specialists.vulns.idor.login_role", fake_login_role,
+    )
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    finding = out[0].metadata["evidence"]
+    assert finding["kind"] == "idor_enum_cross_owner"
+
+
+@pytest.mark.asyncio
+async def test_propose_async_phase_3_skipped_after_horizontal_verified(
+    monkeypatch,
+):
+    # Horizontal returns identical body for both roles A and B -> verified
+    # on phase 2, loop breaks before phase 3 can fire. Count probe calls
+    # to verify phase 3 did not run.
+    body = "x" * 512
+    routes: dict[str, Observation] = {
+        # Only baseline URLs; no id=41 / id=43 routes exist — if phase 3
+        # ran, we'd see a 404 call here. We assert on the URL set instead.
+        "http://x/r?id=42": _obs(200, body),
+    }
+    tracer = FakeTracer()
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=tracer,
+        role_a_password="pwA",
+        role_b_password="pwB",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/r?id=42"
+    state.auth_roles.login_url = "http://x/login"
+    _seed_role(state, "A", "alice")
+    _seed_role(state, "B", "bob")
+
+    async def fake_login_role(*, http_tool, login_url, role_name, username,
+                               password, user_field, pass_field):
+        return LoginAttemptResult(
+            session=RoleSession(
+                role_name=role_name, username=username,
+                cookies={"sid": f"{role_name}-cookie"}, established=True,
+            ),
+            status_code=200, response_url=login_url,
+            set_cookie_count=1, failure_reason=None,
+        )
+
+    monkeypatch.setattr(
+        "penage.specialists.vulns.idor.login_role", fake_login_role,
+    )
+    out = await specialist.propose_async(state, config=SpecialistConfig())
+    assert len(out) == 1
+    finding = out[0].metadata["evidence"]
+    assert finding["kind"] == "idor_horizontal_identical_body"
+    # No probe calls for ids != 42.
+    probe_urls = [
+        c.params.get("url") for c in specialist.http_tool.calls
+        if "id=41" in (c.params.get("url") or "")
+        or "id=43" in (c.params.get("url") or "")
+    ]
+    assert probe_urls == []
+
+
+@pytest.mark.asyncio
+async def test_propose_async_phase_3_cookies_from_role_a(monkeypatch):
+    baseline = "<html>alice@real.com" + " padding " * 40 + "</html>"
+    probe = "<html>bob@other.com" + " padding " * 40 + "</html>"
+    routes = {
+        "http://x/r?id=42": _obs(200, baseline),
+        "http://x/r?id=41": _obs(200, probe),
+    }
+    tracer = FakeTracer()
+    specialist = IdorSpecialist(
+        http_tool=FakeHttpByUrl(routes),
+        tracer=tracer,
+        role_a_password="pwA",
+        role_b_password="pwB",
+    )
+    state = State(base_url="http://x")
+    state.last_http_url = "http://x/r?id=42"
+    state.auth_roles.login_url = "http://x/login"
+    _seed_role(state, "A", "alice")
+    _seed_role(state, "B", "bob")
+
+    async def fake_login_role(*, http_tool, login_url, role_name, username,
+                               password, user_field, pass_field):
+        established = role_name == "A"
+        cookies = {"sid": "A-cookie"} if established else {}
+        return LoginAttemptResult(
+            session=RoleSession(
+                role_name=role_name, username=username,
+                cookies=cookies, established=established,
+            ),
+            status_code=200, response_url=login_url,
+            set_cookie_count=1 if established else 0,
+            failure_reason=None if established else "no_set_cookie",
+        )
+
+    monkeypatch.setattr(
+        "penage.specialists.vulns.idor.login_role", fake_login_role,
+    )
+    await specialist.propose_async(state, config=SpecialistConfig())
+    # Filter to HTTP calls against the target URL (phase 3 baseline+probe).
+    target_calls = [
+        c for c in specialist.http_tool.calls
+        if (c.params.get("url") or "").startswith("http://x/r?id=")
+    ]
+    assert target_calls, "phase 3 must have fired at least one request"
+    for call in target_calls:
+        assert call.params.get("cookies") == {"sid": "A-cookie"}
