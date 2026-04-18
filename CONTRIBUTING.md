@@ -16,9 +16,18 @@ Thanks for contributing.
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install -e .[dev]
-pytest -q
+pip install -e ".[dev]" anthropic openai
+python -m pytest -q
 ```
+
+Notes for a fresh sandbox / fresh dev environment:
+
+- Run `pip install -e ".[dev]" anthropic openai`. The `anthropic` and `openai`
+  SDKs are not pinned in `[dev]` extras but are required by LLM-backed tests.
+  Without them, ~7+ tests will ImportError.
+- Use `python -m pytest`, not bare `pytest`. The latter is vulnerable to PATH
+  shadowing in some sandbox environments (mismatched venv resolution).
+- Default remote branch is `master` (not `main`).
 
 ## Branching
 
@@ -107,6 +116,13 @@ so they need a working LLM and a Docker sandbox:
    the first E2E run. The full image provides curl (which
    `python:3.12-slim` lacks); penage's coordinator uses curl-based
    shell recon in early steps.
+
+   *Note:* Production sandbox defaults (`penage/cli/run_one.py:62`,
+   `penage/sandbox/docker.py:15`) still reference `python:3.12-slim`.
+   This is a known limitation (tracked in stage 5 backlog: production
+   sandbox curl readiness). The E2E helper
+   (`tests/support/e2e_config.py`) overrides to `python:3.12` for test
+   reliability.
 4. Bring DVWA up, run pytest, tear down:
 
    ```bash
@@ -117,6 +133,25 @@ so they need a working LLM and a Docker sandbox:
 
 Tests skip cleanly (not fail) when LLM credentials or the Docker
 daemon are unavailable.
+
+### Environment variables
+
+Penage-specific env vars consumed by code and tests. Providers'
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` are standard and documented
+above; the table below covers `PENAGE_*` overrides.
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `PENAGE_UPDATE_GOLDEN` | Regenerate golden trace files under `tests/integration/golden/` (use sparingly; commits trace deltas). Set to `1` to accept. | unset |
+| `PENAGE_E2E_LLM_PROVIDER` | LLM provider override for E2E (`openai` / `anthropic` / `ollama`). | unset (auto-detect from `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, preferring OpenAI) |
+| `PENAGE_E2E_LLM_MODEL` | LLM model identifier override for E2E. | provider's `DEFAULT_MODEL` (`penage/llm/<provider>.py`) |
+| `PENAGE_E2E_SANDBOX_BACKEND` | Sandbox backend for E2E (`docker` / `null`). | `docker` |
+| `PENAGE_E2E_OLLAMA_URL` | Ollama endpoint when `PENAGE_E2E_LLM_PROVIDER=ollama`. | `http://localhost:11434` |
+| `PENAGE_IDOR_ROLE_A_USER` | IDOR specialist role-A username (paired with the `--idor-role-a-user` CLI flag). | unset |
+| `PENAGE_IDOR_ROLE_A_PASS` | IDOR specialist role-A password. | unset |
+| `PENAGE_IDOR_ROLE_B_USER` | IDOR specialist role-B username. | unset |
+| `PENAGE_IDOR_ROLE_B_PASS` | IDOR specialist role-B password. | unset |
+| `PENAGE_IDOR_LOGIN_URL` | IDOR login URL override (bypasses `state.forms_by_url` discovery). | unset |
 
 ## Security note
 
