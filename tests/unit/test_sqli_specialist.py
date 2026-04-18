@@ -13,7 +13,7 @@ from penage.core.state import State
 from penage.llm.fake import FakeLLMClient
 from penage.memory.store import MemoryStore
 from penage.specialists.base import SpecialistConfig
-from penage.specialists.vulns.sqli import SqliSpecialist
+from penage.specialists.vulns.sqli import SqliSpecialist, _SqliTarget, _build_probe_action
 
 
 Responder = Callable[[Action], Observation]
@@ -224,6 +224,76 @@ async def test_sqli_specialist_writes_phase_trace_events(tmp_path):
     phases = sorted({e["payload"]["phase"] for e in phase_events})
     # Phase 3 (blind) may be skipped when an error-based verified finding appears first.
     assert 1 in phases and 2 in phases
+
+
+def test_discover_targets_preserves_get_siblings():
+    specialist = SqliSpecialist(
+        http_tool=FakeHttp(responder=lambda a: _ok_response("ok", url="x")),
+        llm_client=FakeLLMClient(fixed_text=""),
+        memory=None,
+    )
+    state = State(base_url="http://dvwa.local")
+    state.last_http_url = "http://dvwa.local/vulnerabilities/sqli/?id=1&Submit=Submit"
+
+    targets = specialist._discover_targets(state)
+
+    assert len(targets) == 2
+    by_param = {t.parameter: t for t in targets}
+    assert by_param["id"].baseline_params == {"Submit": "Submit"}
+    assert by_param["id"].url == "http://dvwa.local/vulnerabilities/sqli/"
+    assert by_param["id"].channel == "GET"
+    assert by_param["Submit"].baseline_params == {"id": "1"}
+
+
+def test_build_probe_action_get_layers_siblings():
+    target = _SqliTarget(
+        url="http://dvwa.local/vulnerabilities/sqli/",
+        parameter="id",
+        channel="GET",
+        baseline_params={"Submit": "Submit"},
+    )
+    payload = "1' OR '1'='1"
+
+    action = _build_probe_action(target, payload)
+
+    assert action.params["method"] == "GET"
+    query = dict(parse_qsl(urlparse(action.params["url"]).query, keep_blank_values=True))
+    assert query == {"id": payload, "Submit": "Submit"}
+
+
+def test_build_probe_action_post_merges_siblings():
+    target = _SqliTarget(
+        url="http://dvwa.local/login.php",
+        parameter="username",
+        channel="POST",
+        baseline_params={"Login": "Login", "password": "x"},
+    )
+    payload = "admin' --"
+
+    action = _build_probe_action(target, payload)
+
+    assert action.params["method"] == "POST"
+    assert action.params["data"] == {
+        "username": payload,
+        "Login": "Login",
+        "password": "x",
+    }
+
+
+def test_build_probe_action_param_overrides_same_name_sibling():
+    target = _SqliTarget(
+        url="http://dvwa.local/vulnerabilities/sqli/",
+        parameter="id",
+        channel="GET",
+        baseline_params={"id": "old", "Submit": "Submit"},
+    )
+    payload = "2"
+
+    action = _build_probe_action(target, payload)
+
+    query = dict(parse_qsl(urlparse(action.params["url"]).query, keep_blank_values=True))
+    assert query["id"] == payload
+    assert query["Submit"] == "Submit"
 
 
 @pytest.mark.asyncio
