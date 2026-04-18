@@ -14,6 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_EXECUTION_MARKERS: tuple[str, ...] = ("__penage_xss_marker__",)
+
+# DEFAULT_PROBE_EXPR is a JS expression evaluated inside the headless browser
+# after payload delivery. Contract:
+#   1. Must return a *string* — page-side ``JSON.stringify`` guarantees the
+#      value survives the sandbox→runtime boundary as a plain str (numbers,
+#      arrays, and records are all serialised), with ``"`` / newlines / control
+#      characters escaped to their JSON forms.
+#   2. The string is parsed back via ``json.loads`` in ``_parse_execution_markers``;
+#      a non-JSON return would mean the probe didn't run and is treated as
+#      "no execution evidence".
+#   3. The ``|| []`` fallback ensures an empty-array JSON literal when the
+#      payload hasn't fired — this yields a well-formed, clearly-empty result
+#      instead of ``undefined`` (which stringifies to the literal ``"undefined"``
+#      string and would confuse downstream matchers).
+# Override via ``BrowserEvidenceValidator(..., probe_expr=...)`` when probing
+# alternative execution markers.
 DEFAULT_PROBE_EXPR: str = "JSON.stringify(window.__penage_xss_marker__ || [])"
 
 _DOM_FRAGMENT_WINDOW: int = 160

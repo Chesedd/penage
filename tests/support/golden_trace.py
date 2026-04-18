@@ -39,6 +39,20 @@ _ISO_TS_RE = re.compile(
 # stamps ``ts_ms`` on every event via :class:`penage.core.tracer.JsonlTracer`;
 # ``elapsed_ms`` / ``duration_ms`` may appear inside Observation-like payloads.
 # When either is present, the value is replaced with a stable placeholder.
+#
+# What makes a key "ephemeral": its value is a function of wall-clock time or
+# measured runtime (timestamps, elapsed deltas), not of the episode's semantic
+# state. Two replays of the same episode against a deterministic target will
+# diverge on these keys while every other field stays stable.
+#
+# Specific entries:
+#   ts_ms / timestamp     — event emission time stamped by the tracer.
+#   started_at / finished_at — per-step or per-action wall-clock boundaries.
+#   duration_ms / elapsed_ms — measured subprocess / HTTP latency.
+#
+# Invariant: normalized traces replace these values with ``<KEY_UPPER>`` before
+# golden-diff comparison — i.e. ephemeral keys are excluded from replay-
+# equality checks while every non-ephemeral field must match byte-for-byte.
 _EPHEMERAL_KEYS: frozenset[str] = frozenset(
     {
         "ts_ms",

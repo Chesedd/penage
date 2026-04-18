@@ -69,6 +69,25 @@ _VERSION_PATTERNS: dict[str, re.Pattern[str]] = {
 
 @dataclass(slots=True)
 class _SqliTarget:
+    """Descriptor of a single parameter probe surface for the SQLi specialist.
+
+    Fields:
+      url: endpoint URL (query string may already carry context params on GET).
+      parameter: name of the parameter under test; its value is mutated on each probe.
+      channel: transport — ``"GET"`` (query-string) or ``"POST"`` (form body).
+      baseline_params: **sibling** fields that must accompany every probe for the
+        endpoint to reach its SQL execution path. For GET: extra query-string
+        pairs shipped alongside ``parameter``. For POST: default form-field
+        values (e.g., DVWA's ``Submit=Submit`` submit-button field — without it
+        the handler early-returns before query dispatch).
+
+    Invariant: ``parameter`` **always overrides** any sibling with the same name.
+    Merge order is baseline first, probe value last (see ``_send_probe``).
+
+    Backstory: wired up in δ.β.2.b.ii after root-cause audit of a DVWA SQLi E2E
+    failure — probes without the ``Submit=Submit`` sibling never reached MySQL.
+    """
+
     url: str
     parameter: str
     channel: str  # "GET" | "POST"

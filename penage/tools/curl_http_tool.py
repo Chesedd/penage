@@ -20,6 +20,25 @@ _DEFAULT_UA = (
 
 @dataclass(slots=True)
 class CurlHttpTool:
+    """Curl-backed HTTP executor that runs inside the configured sandbox.
+
+    Each ``run(action)`` call builds a ``curl`` command line, throttles through
+    the per-host ``RateLimiter``, then invokes ``sandbox.exec``. The curl
+    subprocess inherits the sandbox's network / filesystem isolation.
+
+    Rate-limit integration:
+      * A per-host :class:`penage.core.rate_limit.RateLimiter` enforces the
+        configurable RPS cap (``RuntimeConfig.rate_limit_rps``). When the cap
+        is reached, ``acquire()`` blocks up to ``rate_limit_timeout_s`` before
+        raising.
+      * Throttling is applied **before** the curl subprocess is spawned, so
+        bursty planners cannot over-shoot into actual HTTP dispatch — the
+        limiter is the authoritative gate, not a post-facto counter.
+      * A ``RateLimiter(None)`` (the default when no limiter is supplied) is a
+        no-op and imposes no caps; explicit limiters must be wired by the
+        runtime builder for production runs.
+    """
+
     sandbox: Sandbox
     allowed_hosts: set[str]
     rate_limiter: RateLimiter
