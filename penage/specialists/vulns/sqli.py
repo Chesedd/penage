@@ -504,7 +504,8 @@ class SqliSpecialist(AsyncSpecialist):
                 method = str(form.get("method") or "POST").upper()
                 if method not in {"GET", "POST"}:
                     continue
-                for inp in form.get("inputs") or []:
+                inputs = form.get("inputs") or []
+                for inp in inputs:
                     name = str(inp.get("name") or "")
                     itype = str(inp.get("type") or "").lower()
                     if not name or itype in _SKIP_INPUT_TYPES:
@@ -513,7 +514,20 @@ class SqliSpecialist(AsyncSpecialist):
                     if key in seen:
                         continue
                     seen.add(key)
-                    targets.append(_SqliTarget(url=action_url, parameter=name, channel=method))
+                    siblings: dict[str, Any] = {}
+                    for other in inputs:
+                        other_name = str(other.get("name") or "")
+                        if not other_name or other_name == name:
+                            continue
+                        siblings[other_name] = str(other.get("value") or "")
+                    targets.append(
+                        _SqliTarget(
+                            url=action_url,
+                            parameter=name,
+                            channel=method,
+                            baseline_params=siblings,
+                        )
+                    )
 
         last_url = state.last_http_url
         if last_url:
@@ -523,12 +537,21 @@ class SqliSpecialist(AsyncSpecialist):
                 parsed = None
             if parsed is not None and parsed.query:
                 base = urlunparse(parsed._replace(query=""))
-                for name, _value in parse_qsl(parsed.query, keep_blank_values=True):
+                pairs = parse_qsl(parsed.query, keep_blank_values=True)
+                for name, _value in pairs:
                     key = (base, name)
                     if key in seen:
                         continue
                     seen.add(key)
-                    targets.append(_SqliTarget(url=base, parameter=name, channel="GET"))
+                    siblings = {k: v for k, v in pairs if k != name}
+                    targets.append(
+                        _SqliTarget(
+                            url=base,
+                            parameter=name,
+                            channel="GET",
+                            baseline_params=siblings,
+                        )
+                    )
 
         return targets
 
@@ -603,11 +626,16 @@ class SqliSpecialist(AsyncSpecialist):
 
 def _build_probe_action(target: _SqliTarget, payload: str) -> Action:
     if target.channel == "GET":
-        probe_url = _set_query_param(target.url, target.parameter, payload)
+        probe_url = target.url
+        for sib_name, sib_value in target.baseline_params.items():
+            probe_url = _set_query_param(probe_url, sib_name, str(sib_value))
+        probe_url = _set_query_param(probe_url, target.parameter, payload)
         return Action(type=ActionType.HTTP, params={"method": "GET", "url": probe_url}, timeout_s=12.0, tags=["sqli", "probe"])
+    body: dict[str, Any] = {k: str(v) for k, v in target.baseline_params.items()}
+    body[target.parameter] = payload
     return Action(
         type=ActionType.HTTP,
-        params={"method": "POST", "url": target.url, "data": {target.parameter: payload}},
+        params={"method": "POST", "url": target.url, "data": body},
         timeout_s=12.0,
         tags=["sqli", "probe"],
     )
