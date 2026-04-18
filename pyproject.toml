@@ -27,6 +27,14 @@ llm = [
   "anthropic>=0.40,<1.0",
   "openai>=1.50,<3.0",
 ]
+# Playwright pin policy: the Python package ships its own bundled browser
+# revisions and the API contract is stable across 1.x; we cap at <2.0 so a
+# future 2.x bundle swap requires explicit revalidation of the E2E trio.
+# Chromium itself is NOT installed as a Python dependency — after installing
+# the ``browser`` extra, run ``playwright install chromium`` to fetch the
+# matching browser binary. Bumping the pin requires re-running
+# ``playwright install chromium`` and revalidating browser-verified XSS
+# findings (see ``docs/roadmap/stage5.md`` §6.2).
 browser = [
   "playwright>=1.40,<2.0",
 ]

@@ -92,6 +92,8 @@ trigger observation is not causally tied to the inject request's response.
 XSS-medium (#5) land and after any stage-5 browser-layer refactors (which
 may collapse the gap closure into a larger validator redesign).
 
+See `docs/roadmap/stage5.md` §2.1 for the consolidated stage 5 backlog entry.
+
 ### 3.4 SQLi (decision: **go**)
 
 #### 3.4.1 Vulnerability class + attack mechanics
