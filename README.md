@@ -160,14 +160,67 @@ By default, if `--summary-json` is not provided, the summary is written next to 
 
 ## Testing
 
+penage uses pytest with marker-based test selection. The default suite is fast
+and self-contained; heavier suites are opt-in behind markers.
+
+### Test layout
+
+| Category | Marker | Location | Runs by default |
+|----------|--------|----------|-----------------|
+| Unit | _(none / implicit)_ | `tests/unit/` | yes |
+| Integration | `integration` | `tests/integration/` (excluding `e2e/`) | yes |
+| E2E DVWA | `e2e_dvwa` | `tests/integration/e2e/` | **no** (deselected) |
+| Slow / chromium | `integration_slow` | `tests/integration/` (chromium, playwright) | **no** (deselected) |
+
+Markers are declared in `pytest.ini`. The default `addopts` value
+(`-m "not integration_slow and not e2e_dvwa"`) deselects the heavy suites so
+`python -m pytest -q` stays fast and CI-friendly.
+
+### Running tests
+
+Default suite (unit + integration, no chromium, no DVWA):
+
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
-Tests are organized into:
+Unit tests only:
 
-- `tests/unit/` — focused unit tests
-- `tests/integration/` — multi-component and flow tests
+```bash
+python -m pytest -q tests/unit/
+```
+
+Integration tests, excluding E2E:
+
+```bash
+python -m pytest -q tests/integration/ --ignore=tests/integration/e2e
+```
+
+E2E suite against a running DVWA instance (requires Docker + `docker pull python:3.12`;
+bring the stack up with `docker compose -f compose/e2e_dvwa.yml up -d` first):
+
+```bash
+python -m pytest -m e2e_dvwa tests/integration/e2e/ -o addopts= -v
+```
+
+Slow / chromium-launching integration checks:
+
+```bash
+python -m pytest -m integration_slow -o addopts= -v
+```
+
+Single test by name:
+
+```bash
+python -m pytest tests/unit/path/to/test_x.py::test_y -v
+```
+
+Convenience `make` targets wrap the same commands: `make test`, `make unit`,
+`make integration`, `make e2e`, `make slow`.
+
+For environment setup (SDKs, env vars, fresh sandbox install, E2E prerequisites)
+see [CONTRIBUTING.md](CONTRIBUTING.md#development-setup) and the
+"Opt-in E2E suites" / "Environment variables" sections therein.
 
 ## Documentation
 
