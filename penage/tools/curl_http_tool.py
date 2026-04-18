@@ -20,6 +20,21 @@ _DEFAULT_UA = (
 
 @dataclass(slots=True)
 class CurlHttpTool:
+    """``curl``-backed HTTP tool executed inside the configured ``Sandbox``.
+
+    Rate-limit integration: every request is wrapped in
+    :meth:`penage.core.rate_limit.RateLimiter.acquire`, a per-host concurrency
+    gate configured via :class:`~penage.app.runtime_factory.RuntimeComponents`
+    (one limiter per episode, shared with the browser validator). The gate
+    bounds in-flight requests per host; requests past the cap await an open
+    slot before the ``curl`` subprocess is spawned, so concurrency control
+    runs **before** any network I/O.
+
+    When the limiter is constructed with ``max_concurrent_per_host=None`` /
+    ``0`` the gate is a zero-overhead no-op — used when a test or ablation
+    path needs the tool without host throttling.
+    """
+
     sandbox: Sandbox
     allowed_hosts: set[str]
     rate_limiter: RateLimiter

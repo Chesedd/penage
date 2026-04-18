@@ -69,6 +69,24 @@ _VERSION_PATTERNS: dict[str, re.Pattern[str]] = {
 
 @dataclass(slots=True)
 class _SqliTarget:
+    """Single SQLi probe target: a (url, parameter, channel) triple plus siblings.
+
+    ``baseline_params`` carries **sibling** query-string pairs (GET) or form-field
+    default values (POST) that must be present on every probe request for the
+    target endpoint to enter its SQL execution path. Example: DVWA's SQLi form
+    requires ``Submit=Submit`` alongside ``id=<payload>``; without the submit
+    trigger the server short-circuits before touching MySQL.
+
+    Invariant: ``parameter`` **always overrides** any sibling with the same
+    name. Construction order matters — callers must emit ``baseline_params``
+    first and then set the parameter under test, so the injected payload wins
+    on key collision.
+
+    Wired up in δ.β.2.b.ii after root-cause audit of the DVWA SQLi E2E failure:
+    probes without the form's submit trigger never reached the backend, so all
+    timing deltas were indistinguishable from noise.
+    """
+
     url: str
     parameter: str
     channel: str  # "GET" | "POST"

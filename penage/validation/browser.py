@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_EXECUTION_MARKERS: tuple[str, ...] = ("__penage_xss_marker__",)
+# JS expression evaluated inside the headless browser after the payload is
+# loaded. Contract:
+#   - Must produce a string literal valid as reflection-point evidence —
+#     the browser tool returns the expression's string value to the host.
+#   - ``JSON.stringify`` semantics: escapes ``"``, newlines, control chars;
+#     output is HTML-safe and single-line (so it survives the trace / log
+#     pipeline without further escaping).
+#   - ``|| []`` fallback guarantees a well-formed JSON array even when the
+#     init script has not yet installed the marker (payload crashed early,
+#     navigation interrupted, etc.) — ``_parse_execution_markers`` below
+#     can then degrade gracefully to "no evidence".
+# Downstream matcher calls ``json.loads`` on the returned string to extract
+# ``{type, message}`` records; a substring match on the serialized form is
+# acceptable for diagnostics but not for a verified finding.
 DEFAULT_PROBE_EXPR: str = "JSON.stringify(window.__penage_xss_marker__ || [])"
 
 _DOM_FRAGMENT_WINDOW: int = 160

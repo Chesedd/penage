@@ -86,6 +86,24 @@ class Orchestrator:
         max_total_text_len: Optional[int] = 200_000,
         early_stop: Optional[EarlyStopThresholds] = None,
     ) -> tuple[State, UsageTracker]:
+        """Run the outer pentest loop for up to ``max_steps`` iterations.
+
+        ``user_prompt`` — free-form instruction used as a planner bias. Example:
+        ``"target http://host:8080/vuln.php; probe 'id' parameter for SQLi"``
+        steers the coordinator LLM toward a specific vuln class + endpoint
+        without requiring a per-class config knob on ``RuntimeConfig`` (there
+        is no ``vuln_class`` setting — the prompt is the mechanism).
+
+        The parameter is NOT validated and NOT parsed by the runtime — it is
+        passed through as an opaque tail appended to the coordinator's system
+        prompt.
+
+        Invariant: specialist instances run independently of ``user_prompt``
+        — they always activate on matching endpoint context via
+        ``SpecialistManager.propose_all_async``. There is no
+        "specialist bypass" via prompt phrasing; the prompt only biases the
+        LLM's action selection, not the specialist gate.
+        """
         st = state or State()
         tracker = UsageTracker()
         self.tracer.record_note("episode_start", step=0)

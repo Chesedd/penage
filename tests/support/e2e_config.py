@@ -107,6 +107,21 @@ def detect_sandbox_backend() -> str:
     Override via ``PENAGE_E2E_SANDBOX_BACKEND``. Empty string also falls
     back to ``"docker"`` so a blank-but-present env var doesn't silently
     disable sandboxing.
+
+    Supported values:
+
+    * ``"docker"`` (default, production) — containerized sandbox execution.
+      All hardening flags from ``DockerSandbox._base_docker_run_args`` apply
+      (``--network none``, ``--read-only``, ``--cap-drop ALL``, etc.). This
+      is the only backend appropriate for untrusted payloads.
+    * ``"null"`` — no sandbox; recon steps that require shell execution are
+      skipped upstream. **DEV ONLY** convenience for fast E2E iteration on
+      hosts without a reachable Docker daemon. Do not use against untrusted
+      targets — there is no isolation boundary.
+
+    Production deployments always resolve to ``"docker"``: the helper default
+    is ``"docker"``, the prod ``RuntimeConfig`` default is ``"docker"``, and
+    CI keeps the env var unset so this default applies.
     """
     raw = os.environ.get("PENAGE_E2E_SANDBOX_BACKEND", "").strip()
     return raw or "docker"

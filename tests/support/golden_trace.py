@@ -39,6 +39,17 @@ _ISO_TS_RE = re.compile(
 # stamps ``ts_ms`` on every event via :class:`penage.core.tracer.JsonlTracer`;
 # ``elapsed_ms`` / ``duration_ms`` may appear inside Observation-like payloads.
 # When either is present, the value is replaced with a stable placeholder.
+#
+# "Ephemeral" here means: value lifecycle is per-step / per-episode wall-clock
+# and is therefore non-deterministic across replays. Including such a value
+# in a golden-trace diff would make every CI run a spurious mismatch, so
+# these keys are redacted to a placeholder before comparison.
+#
+# Invariant: any key listed here is excluded from golden-trace diffs (value
+# replaced with ``<KEY_UPPERCASED>``). Add a new key only when its value is
+# confirmed to vary purely by wall-clock / timing and has no downstream
+# determinism contract. Durable trace fields (URLs, status codes, hashes,
+# action kinds) stay out of this set.
 _EPHEMERAL_KEYS: frozenset[str] = frozenset(
     {
         "ts_ms",

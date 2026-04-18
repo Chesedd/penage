@@ -45,6 +45,24 @@ class State:
 
     last_forms: List[dict[str, object]] = field(default_factory=list)
     known_paths: Set[str] = field(default_factory=set)
+    # Mapping from URL to list of form descriptors; each form has shape:
+    #   {
+    #     "method": str,           # HTTP method ("get"/"post"), as extracted
+    #     "action": str,           # resolved absolute URL (via urljoin with base_url)
+    #     "inputs": list[dict],    # one entry per <input>/<textarea>/<select>
+    #   }
+    # Each ``inputs`` entry has shape:
+    #   {
+    #     "name": str,       # input element name; "" for nameless — should be skipped
+    #     "type": str,       # lowercased (e.g. "text", "hidden", "submit", "password")
+    #     "value": str,      # default or pre-filled value; "" if absent
+    #     "required": bool,  # from HTML ``required`` attribute
+    #     "hidden": bool,    # type == "hidden" OR inferred style display:none
+    #   }
+    # Note: submit-type inputs are excluded from SQLi target discovery
+    # (_SKIP_INPUT_TYPES in penage/specialists/vulns/sqli.py) but remain as
+    # sibling fields in other targets' baseline_params so the form submit
+    # trigger still fires.
     forms_by_url: Dict[str, List[dict[str, object]]] = field(default_factory=dict)
 
     http_requests_used: int = 0
@@ -90,6 +108,22 @@ class State:
     policy_name: str = ""
     policy_chosen_source: str = ""
 
+    # Ring of recent validation outcomes. Despite the name, this is
+    # ``list[dict[str, Any]]``, NOT ``list[ValidationResult]`` — there is no
+    # ``ValidationResult`` dataclass in the core state tree. Each entry has
+    # the following keys:
+    #   - ``kind``: str  (e.g. "xss_finding", "sqli_finding", "evidence_note")
+    #   - ``level``: str — one of ``"validated"`` | ``"evidence"`` | ``"rejected"``
+    #   - ``url``: str
+    #   - ``parameter``: str
+    #   - ``payload``: str
+    #   - ``details``: dict — validator-specific nested payload
+    # Access pattern: ``r.get("level")`` (dict lookup, NOT attribute access).
+    # Early test code that tried attribute access failed silently — if you
+    # are tempted to write ``r.level`` here, stop.
+    # Populated by :class:`penage.validation.gate.ValidationGate` (for HTTP
+    # actions routed through the gate) and by specialist-direct NOTE findings
+    # for SQLi (which bypasses the gate to emit findings inline).
     validation_results: List[Dict[str, object]] = field(default_factory=list)
     validation_results_limit: int = 10
     validation_evidence_count: int = 0
