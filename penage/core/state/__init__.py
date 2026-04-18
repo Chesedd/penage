@@ -45,6 +45,25 @@ class State:
 
     last_forms: List[dict[str, object]] = field(default_factory=list)
     known_paths: Set[str] = field(default_factory=set)
+
+    # forms_by_url: mapping from page URL to a list of form descriptors observed
+    # on that page. Each form entry has shape:
+    #   {
+    #     "method": str,        # "GET" | "POST" (uppercased)
+    #     "action": str,        # absolute action URL (resolved against base_url)
+    #     "inputs": list[dict], # one entry per <input> / <textarea> / <select>:
+    #         {
+    #           "name":     str,   # element name; "" for nameless (skipped downstream)
+    #           "type":     str,   # lowercased; e.g. "text", "hidden", "submit", "password"
+    #           "value":    str,   # default or pre-filled value; "" if absent
+    #           "required": bool,  # from HTML `required` attribute
+    #           "hidden":   bool,  # type=="hidden" OR inferred CSS display:none
+    #         }
+    #   }
+    # Note: submit-type inputs are typically excluded from SQLi / XSS target
+    # discovery (see ``_SKIP_INPUT_TYPES`` in specialists) but remain as sibling
+    # fields in other targets' ``baseline_params`` so the form handler actually
+    # processes the probe request.
     forms_by_url: Dict[str, List[dict[str, object]]] = field(default_factory=dict)
 
     http_requests_used: int = 0
@@ -90,6 +109,28 @@ class State:
     policy_name: str = ""
     policy_chosen_source: str = ""
 
+    # validation_results: rolling log of validator verdicts for the episode.
+    #
+    # Type: ``list[dict[str, Any]]`` (NOT ``list[ValidationResult]`` — despite
+    # the name, there is no ``ValidationResult`` dataclass; entries are plain
+    # dicts so trace-serialization is trivial).
+    #
+    # Per-entry shape (keys are not strictly typed; validators extend as needed):
+    #   kind:      str  — finding class (e.g. "xss_finding", "sqli_finding",
+    #                     "sqli_error_fingerprint", "idor_finding").
+    #   level:     str  — one of {"validated", "evidence", "rejected"}.
+    #   url:       str  — endpoint under test.
+    #   parameter: str  — injected parameter name.
+    #   payload:   str  — serialised payload delivered.
+    #   details:   dict — validator-specific evidence (timing samples,
+    #                     extracted strings, browser DOM excerpt, etc.).
+    #
+    # Access pattern: use dict access (``r.get("level")``), **not** attribute
+    # access (``r.level``) — early test code tripped on the latter.
+    #
+    # Populated by ``ValidationGate`` for HTTP actions routed through the gate,
+    # and directly by specialist NOTE emissions for flows that bypass the gate
+    # (e.g. SQLi blind-timing findings which do their own validation).
     validation_results: List[Dict[str, object]] = field(default_factory=list)
     validation_results_limit: int = 10
     validation_evidence_count: int = 0

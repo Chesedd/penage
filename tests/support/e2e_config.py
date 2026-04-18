@@ -107,6 +107,22 @@ def detect_sandbox_backend() -> str:
     Override via ``PENAGE_E2E_SANDBOX_BACKEND``. Empty string also falls
     back to ``"docker"`` so a blank-but-present env var doesn't silently
     disable sandboxing.
+
+    Supported values:
+      ``"docker"`` (default)
+          Containerised sandbox execution — per-episode daemon container
+          with the hardening flags enumerated in
+          ``DockerSandbox._base_docker_run_args`` (``--network none``,
+          ``--read-only``, ``--cap-drop ALL``, non-root user, pid/mem/fsize
+          caps, etc.). This is the helper default **and** the prod-runtime
+          default; production deployments should not deviate.
+          See CLAUDE.md invariant 11 for the episode-lifetime contract.
+      ``"null"``
+          No-op sandbox — tool calls that need shell execution are
+          skipped, and recon-via-shell specialists won't fire. Intended
+          as a docker-unavailable fallback for fast E2E iteration on
+          HTTP-only flows; the security model is relaxed and **must
+          not** be used for untrusted payload execution.
     """
     raw = os.environ.get("PENAGE_E2E_SANDBOX_BACKEND", "").strip()
     return raw or "docker"

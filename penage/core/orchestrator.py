@@ -86,6 +86,23 @@ class Orchestrator:
         max_total_text_len: Optional[int] = 200_000,
         early_stop: Optional[EarlyStopThresholds] = None,
     ) -> tuple[State, UsageTracker]:
+        """Run the full outer loop for a single pentest episode.
+
+        ``user_prompt`` is a free-form planner-bias string appended verbatim to
+        the coordinator's system prompt. Typical use: nudge the LLM toward a
+        specific target / vuln class without adding a per-class config knob —
+        e.g. ``"target http://localhost:8080; probe 'id' for SQLi"``.
+
+        Contract:
+          * The prompt is **opaque** — it is not parsed, validated, or mapped
+            to any structured field on ``RuntimeConfig``.
+          * It steers only the coordinator's action proposals. **Specialist
+            activation is independent**: specialists trigger on matching
+            endpoint context regardless of prompt text, so a misleading or
+            empty prompt cannot bypass a specialist.
+          * Downstream safety (``Guard`` allow-list, sandbox isolation,
+            validation gate) is unaffected by prompt contents.
+        """
         st = state or State()
         tracker = UsageTracker()
         self.tracer.record_note("episode_start", step=0)
