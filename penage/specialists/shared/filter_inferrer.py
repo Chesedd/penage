@@ -53,7 +53,20 @@ class _HttpBackend(Protocol):
 
 
 class FilterInferrer:
-    """Infers which tags, events, and special characters a filter lets through."""
+    """Infers which tags, events, and special characters a filter lets through.
+
+    Model: byte-exact, lowercase-only. Observes the reflected response between
+    a pair of unique markers and derives a per-probe verdict
+    (``allowed`` / ``blocked`` / ``transformed``) from substring equality.
+
+    Known limitation: does NOT model case-mix bypass (``<ScRiPt>``,
+    ``<SCRIPT>``, etc.). For filters that are case-sensitive (e.g. DVWA XSS
+    medium's ``str_replace("<script>", "", input)``), the inferrer treats
+    them as fully blocking even though case-variants would bypass.
+    Prerequisite-gating downstream compensates by preferring ``<img>`` /
+    ``<svg>`` tag alternatives over case-mix tricks. Tracked in stage 5
+    backlog for high-severity filter classes (DVWA high).
+    """
 
     def __init__(
         self,
@@ -175,6 +188,8 @@ class FilterInferrer:
             return "blocked", None
 
         observed = text[start:end]
+        # Byte-exact equality — case-mix variants intentionally treated as blocked.
+        # See class docstring for stage-5 extension plan.
         if observed == probe.payload:
             return "allowed", None
         if observed == "":
