@@ -9,6 +9,18 @@ from penage.policy.ranking import PolicyBlockStats, RankedAction
 from penage.utils.fingerprint import action_fingerprint
 
 
+def _is_specialist(ranked: RankedAction) -> bool:
+    """True if `ranked` originated from a specialist rather than the LLM planner.
+
+    ``PolicyRanker._rank_specialist_candidate`` stamps every specialist-sourced
+    ``RankedAction`` with ``source="specialists"`` (the original specialist name
+    — "sqli", "xss", ... — is kept in ``source_name`` for diagnostics). We key on
+    the canonical bucket rather than enumerating individual specialist names so
+    that new specialists auto-qualify without touching selection.py.
+    """
+    return ranked.source == "specialists"
+
+
 @dataclass(slots=True)
 class DiverseActionSelector:
     force_breakout_no_new_paths: int
@@ -82,6 +94,9 @@ class DiverseActionSelector:
 
     def _select_diverse(self, ranked: List[RankedAction], *, k: int) -> List[RankedAction]:
         if k <= 1:
+            top_specialist = next((r for r in ranked if _is_specialist(r)), None)
+            if top_specialist is not None:
+                return [top_specialist]
             return ranked[:1]
 
         chosen: list[RankedAction] = []
